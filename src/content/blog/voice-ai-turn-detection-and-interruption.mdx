@@ -1,0 +1,392 @@
+---
+title: 'AI는 환자가 말을 끝낸 순간을 어떻게 알까? Voice AI의 턴 감지와 끼어들기 기술'
+description: 'VAD, Endpointing, Turn Detection과 Interruption이 자연스러운 전화 대화를 만드는 방법을 병원 Voice AI의 실제 설정과 장애 사례로 설명합니다.'
+pubDate: '2026-08-07'
+heroImage: '../../assets/blog/voice-ai-turn-detection-interruption-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+## 1. 좋은 답변도 타이밍이 어긋나면 나쁜 대화가 된다
+
+환자가 병원에 전화해 예약 날짜를 말한다.
+
+> **AI:** 원하시는 예약 날짜를 말씀해 주세요.
+>
+> **환자:** 다음 주 수요일이요. 아, 잠시만요…
+>
+> **AI:** 다음 주 수요일로 예약을—
+>
+> **환자:** 목요일이 더 좋을 것 같아요.
+
+텍스트로 보면 평범한 대화다. 하지만 전화에서는 어려운 판단이 연달아 일어난다.
+
+- “수요일이요” 뒤의 침묵은 발화 종료였을까, 생각하는 시간이었을까?
+- “잠시만요”를 들은 AI는 얼마나 더 기다려야 할까?
+- AI가 말하는 중 환자가 “목요일”이라고 하면 즉시 멈춰야 할까?
+- 환자의 “네”, “음”, “맞아요”는 새로운 요청일까, 단순한 맞장구일까?
+- 예약을 실제로 등록하는 중이라면 환자의 말 한마디에 작업까지 취소해야 할까?
+
+사람은 상대의 억양과 호흡, 문장의 의미와 대화 맥락을 함께 살핀다. 반면 Voice AI는 전화망으로 들어오는 오디오 신호에서 같은 판단을 실시간으로 내려야 한다.
+
+LLM이 아무리 좋은 문장을 만들어도 환자의 말을 자주 끊거나, 대답해야 할 순간에 오래 침묵하거나, 맞장구를 들을 때마다 멈춘다면 자연스러운 상담으로 느껴지지 않는다. Voice AI에서 대화 품질은 **무엇을 말하는가뿐 아니라 언제 듣고, 기다리고, 말하고, 멈추는가**에 의해 결정된다.
+
+> **TL;DR**
+>
+> - VAD는 오디오에서 사람이 말하고 있는 구간을 찾는다.
+> - Endpointing은 침묵이 얼마나 이어져야 발화가 끝났다고 볼지 결정한다.
+> - Turn Detector는 음성과 문장의 맥락을 이용해 사용자가 대화 차례를 넘겼는지 판단한다.
+> - Interruption은 AI가 말하는 중 사용자가 끼어들었을 때 음성을 멈추고 대화권을 돌려준다.
+> - 실제 서비스에서는 짧은 답변, 맞장구, 잡음, Tool 실행 상태까지 고려해 이 요소들을 함께 조정해야 한다.
+
+---
+
+## 2. 전화에는 전송 버튼이 없다
+
+텍스트 챗봇에서 사용자는 문장을 입력한 뒤 전송 버튼을 누른다. 시스템은 그 순간을 입력의 끝으로 간주하면 된다.
+
+전화에는 전송 버튼이 없다. 오디오는 통화가 끝날 때까지 계속 들어온다. AI는 연속된 신호 안에서 사용자의 한 차례, 즉 turn의 시작과 끝을 직접 찾아야 한다.
+
+<MermaidDiagram chart={`flowchart LR
+    AUDIO["전화망의 연속 오디오"] --> VAD["VAD<br/>사람이 말하는가?"]
+    VAD --> ENDPOINT["Endpointing<br/>침묵이 충분히 길었는가?"]
+    ENDPOINT --> TURN["Turn Detection<br/>대화 차례를 넘겼는가?"]
+    TURN --> RESPONSE["LLM · TTS<br/>AI 답변 생성과 재생"]
+    RESPONSE --> INTERRUPT["Interruption<br/>환자가 다시 말하는가?"]
+    INTERRUPT -. "다시 듣기" .-> VAD`} />
+
+이 단계는 서로 비슷해 보이지만 질문이 다르다.
+
+| 기술 | 해결하려는 질문 | 주로 활용하는 신호 |
+|---|---|---|
+| VAD | 지금 사람 목소리가 있는가? | 오디오의 음향적 특징 |
+| Endpointing | 마지막 음성 뒤 얼마나 기다릴까? | 음성 종료 후 침묵 시간 |
+| Turn Detection | 이 생각이나 문장이 끝났는가? | 음향, 전사 문장, 대화 맥락 |
+| Interruption | 사용자가 AI의 말을 끊으려는가? | 겹쳐 들어온 음성과 STT 결과 |
+
+하나의 기술로 전부 해결하려 하면 어느 한쪽에서 문제가 생긴다. 그래서 실제 Voice AI는 여러 신호를 겹쳐 사용한다.
+
+---
+
+## 3. VAD: 지금 사람이 말하고 있는가
+
+VAD(Voice Activity Detection)는 입력 오디오에서 사람의 음성이 존재하는 구간을 감지한다. 쉽게 말하면 파형을 보면서 “지금 말하는 중”과 “지금은 조용함”을 빠르게 구분하는 센서다.
+
+환자가 말을 시작하면 VAD가 speech start를 감지하고, 음성이 사라지면 speech end 후보를 만든다. 이 신호는 발화 구간을 STT에 전달하고, 사용자가 AI를 끊으려는 순간을 빠르게 포착하는 데 사용된다.
+
+그러나 전화 오디오는 깨끗한 스튜디오 녹음이 아니다.
+
+- 자동차와 길거리 소음
+- 병원 대기실의 다른 사람 목소리
+- 스피커폰에서 되돌아오는 AI 음성
+- 기침, 숨소리, 키보드와 문 닫는 소리
+- 통신망 압축으로 변형된 짧은 음절
+
+민감도를 너무 높이면 기침이나 주변 소리도 발화로 판단한다. 너무 낮추면 “네”와 같은 짧고 작은 대답을 놓칠 수 있다. 우리 서비스에서도 VAD가 초단발 발화를 놓쳤을 때 STT timestamp를 기준으로 처리하는 fallback 경로가 예상보다 늦은 시각을 가리켜, 턴 확정이 수 초 지연되는 문제를 방어한 경험이 있다.
+
+VAD는 매우 빠르지만 **소리의 존재와 문장의 완성은 구분하지 못한다.** 환자가 잠시 숨을 쉬었는지, 할 말을 모두 마쳤는지는 다음 단계가 판단해야 한다.
+
+---
+
+## 4. Endpointing: 침묵은 끝일까, 생각하는 시간일까
+
+환자가 말을 멈췄다고 AI가 바로 응답하면 이런 일이 생긴다.
+
+> **환자:** 예약 날짜는 다음 주…
+>
+> **AI:** 다음 주 언제를 원하시나요?
+>
+> **환자:** 수요일이라고 말하려고 했어요.
+
+Endpointing은 마지막 음성 이후 얼마 동안 기다린 뒤 사용자의 발화를 끝으로 처리할지 결정한다.
+
+```text
+환자 음성  ████████████        ████████
+            다음 주            수요일이요
+                       ↑
+                 생각하는 침묵
+
+너무 짧은 대기  ───────┘  AI가 먼저 응답
+적절한 대기    ───────────────────────┘  한 문장으로 처리
+```
+
+대기시간을 줄이면 AI가 민첩하게 느껴지지만 생각 중인 환자를 자주 끊는다. 늘리면 긴 발화를 안정적으로 받을 수 있지만, 환자는 AI가 듣지 못했다고 생각해 “여보세요?”라고 다시 말할 수 있다.
+
+특히 병원 전화에는 중간 침묵이 많은 입력이 자주 등장한다.
+
+- 생년월일을 기억하며 말하는 경우
+- 여러 날짜 중 가능한 날을 고르는 경우
+- 긴 전화번호나 주소를 전달하는 경우
+- 보호자가 옆 사람에게 내용을 확인하는 경우
+- 고령 환자가 천천히 문장을 이어가는 경우
+
+LiveKit Agents의 endpointing은 최소·최대 지연 범위를 설정할 수 있고, 현재 문서는 고정된 범위뿐 아니라 대화 중 관찰된 pause 통계에 맞춰 기다리는 시간을 바꾸는 dynamic mode도 제공한다. 참고: [Turn-taking tuning](https://docs.livekit.io/agents/logic/turns/tuning/), [LiveKit turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/)
+
+---
+
+## 5. Turn Detector: 사용자가 정말 대화 차례를 넘겼는가
+
+침묵의 길이만으로는 다음 두 문장을 잘 구분하기 어렵다.
+
+- “다음 주 수요일…”
+- “다음 주 수요일로 해주세요.”
+
+첫 번째 문장은 뒤에 설명이 이어질 가능성이 높고, 두 번째 문장은 요청이 완성됐다. Turn Detector는 VAD 위에 음성과 언어 정보를 더해 사용자의 생각이 끝났는지를 예측한다.
+
+한국어에서는 문장 끝 표현도 중요한 단서가 된다.
+
+- “그런데요…”는 다음 내용이 이어질 수 있다.
+- “가능할까요?”는 질문을 마친 경우가 많다.
+- “잠시만요”는 대화 차례를 유지한 채 기다려 달라는 뜻일 수 있다.
+- “네”는 질문에 대한 완전한 답변일 수도 있다.
+
+현재 LiveKit은 대부분의 Agent에 Turn Detector 사용을 권장한다. 공식 문서에 따르면 Turn Detector는 VAD의 침묵 신호에 음향과 발화 의미를 더하고, 한국어를 포함한 여러 언어를 지원한다. 지원되지 않는 언어나 최소 지연이 우선인 환경에서는 VAD-only, STT가 자체 종료 판단을 제공하면 STT endpointing, push-to-talk에서는 manual mode를 선택할 수 있다. 참고: [Turns overview](https://docs.livekit.io/agents/logic/turns/), [Turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/)
+
+중요한 점은 Turn Detector가 Endpointing을 없애는 것이 아니라는 것이다. 모델이 “끝났다”고 높은 확률로 판단하면 빠르게 확정하고, 확신하지 못하면 설정된 최대 지연까지 기다리는 방식으로 함께 작동한다.
+
+---
+
+## 6. Interruption: AI가 말하는 중 환자가 끼어들면
+
+자연스러운 전화에서는 두 사람이 반드시 한 문장씩 완벽하게 번갈아 말하지 않는다.
+
+> **AI:** 예약 가능한 시간은 오전 10시, 오후 2시, 오후 4시—
+>
+> **환자:** 오후 2시로 해주세요.
+
+이때 AI가 나머지 문장을 끝까지 읽으면 환자는 자신의 말을 무시당했다고 느낀다. Interruption 또는 barge-in은 사용자가 말하기 시작했을 때 AI 음성 재생을 멈추고 대화권을 사용자에게 돌려주는 기능이다.
+
+<MermaidDiagram chart={`sequenceDiagram
+    participant AI as AI
+    participant Audio as Turn Handling
+    participant Patient as 환자
+
+    AI->>Patient: 오전 10시, 오후 2시, 오후 4시...
+    Patient-->>Audio: 오후 2시로 해주세요
+    Audio->>Audio: 사용자 음성 감지
+    Audio-->>AI: 현재 TTS 재생 중단
+    Audio->>Audio: 들린 지점까지만 대화 기록에 반영
+    AI->>Patient: 오후 2시로 확인해 드릴게요`} />
+
+LiveKit Agents는 interruption이 확정되면 AI 발화를 멈추고, 대화 기록도 사용자가 실제로 들은 지점까지만 남기도록 잘라낸다. 그래야 LLM이 환자가 듣지 못한 안내까지 이미 전달했다고 오해하지 않는다. 참고: [LiveKit interruptions](https://docs.livekit.io/agents/logic/turns/#interruptions)
+
+하지만 “목소리가 감지되면 무조건 멈춘다”는 규칙은 새로운 문제를 만든다.
+
+---
+
+## 7. “네”, “음”, “아하”는 끼어들기일까
+
+사람은 상대방의 설명을 들으면서 짧은 맞장구를 친다. 이를 backchannel이라고 한다.
+
+> **AI:** 예약 전에 성함과 생년월일을 확인하겠습니다.
+>
+> **환자:** 네.
+>
+> **AI:** 먼저 성함을—
+>
+> **환자:** 음.
+
+“음”은 AI에게 멈추라는 요청이 아닐 가능성이 크다. 반면 다음 상황의 “네”는 반드시 들어야 하는 실제 답이다.
+
+> **AI:** 8월 12일 오후 2시 예약이 맞습니까?
+>
+> **환자:** 네.
+
+같은 짧은 말도 AI가 질문한 뒤에는 답변이고, AI가 긴 설명을 하는 중에는 맞장구일 수 있다. 단어 목록만으로 모든 상황을 구분할 수 없는 이유다.
+
+우리 서비스는 VAD 기반 interruption에 다음 장치를 함께 둔다.
+
+- 일정 시간보다 짧은 소리는 interruption 후보에서 제외한다.
+- STT가 활성화된 경우 최소 단어 수를 적용해 실제 발화인지 확인한다.
+- AI 발화 중 “음”, “어” 같은 추임새만 인식된 final transcript는 새로운 user turn으로 commit하지 않는다.
+- 실제 단어가 확인되지 않은 false interruption이면 짧게 기다린 뒤 멈췄던 AI 음성을 이어서 재생한다.
+
+<MermaidDiagram chart={`flowchart TD
+    SPEECH["AI 발화 중 사용자 음성 감지"] --> LONG{"최소 길이를 넘었는가?"}
+    LONG -->|"아니요"| CONTINUE["AI 발화 유지"]
+    LONG -->|"예"| WORDS{"실제 단어·의도가 확인되는가?"}
+    WORDS -->|"예 · 수정 또는 새 요청"| YIELD["AI 중단 후 사용자 turn 처리"]
+    WORDS -->|"아니요 · 잡음 또는 추임새"| WAIT["False interruption timeout"]
+    WAIT --> RESUME["멈춘 지점부터 AI 발화 재개"]`} />
+
+최신 LiveKit은 VAD 신호 이후 오디오를 추가로 분석해 의도적인 끼어들기와 backchannel을 구분하는 adaptive interruption도 제공한다. 반면 self-hosted 환경에서 VAD mode를 사용하는 우리의 현재 구성에서는 threshold, STT transcript gate와 false-interruption 복구를 조합한다. 참고: [Adaptive interruption handling](https://docs.livekit.io/agents/logic/turns/adaptive-interruption-handling/), [InterruptionOptions](https://docs.livekit.io/reference/agents/turn-handling-options/#interruptionoptions)
+
+---
+
+## 8. 모든 발화를 중단할 수 있게 만들면 안 되는 이유
+
+대화의 자연스러움만 생각하면 환자가 언제든 AI를 끊을 수 있게 하는 편이 좋아 보인다. 그러나 Voice AI는 말만 하는 프로그램이 아니다. 예약 API를 호출하고, 본인 확인을 받고, 상담원 연결을 시작하는 등 실제 업무를 수행한다.
+
+다음 두 동작은 분리해야 한다.
+
+1. **Speech interruption:** 지금 재생 중인 AI 음성을 멈춘다.
+2. **Task cancellation:** 이미 시작한 업무를 취소하거나 결과를 버린다.
+
+예약 가능 시간을 조회하는 읽기 작업은 사용자가 조건을 바꾸면 취소하고 다시 실행해도 된다. 반면 예약 확정 요청이 외부 시스템에 전달된 뒤 무조건 취소하면, 병원 시스템에는 예약이 생겼지만 AI는 실패했다고 말하는 불일치가 생길 수 있다.
+
+| 상황 | 권장 interruption 정책 | 이유 |
+|---|---|---|
+| 긴 병원 정보 안내 | 허용 | 환자가 필요한 정보를 얻으면 바로 다음 질문 가능 |
+| 예약 조건 탐색 | 허용 또는 취소 후 재실행 | 사용자가 날짜·의료진을 바꿀 수 있음 |
+| 예약 최종 확인 질문 | 짧은 답도 허용 | “네”, “아니요”가 핵심 입력 |
+| 예약 확정 API 실행 | 작업 상태 보호 | 중복 실행과 결과 불일치 방지 |
+| Warm Transfer 연결 | 연결 수명주기 보호 | 환자·상담원·trunk 상태를 함께 관리해야 함 |
+| 필수 고지와 종료 안내 | 정책에 따라 제한 | 안내 누락과 잘못된 종료 방지 |
+
+LiveKit 공식 문서도 오래 실행되는 Tool에서 interruption을 **처리해 진행 중 작업을 취소할지**, 또는 **되돌릴 수 없는 작업이 끝날 때까지 interruption을 막을지** 선택하도록 안내한다. 참고: [Function tools — interruptions](https://docs.livekit.io/agents/logic/tools/definition/#handle-interruptions)
+
+---
+
+## 9. 실제로 만난 Speech Interrupt Race Condition
+
+이 구분이 중요한 이유를 운영 중 만난 사례로 살펴보자.
+
+우리 Agent에는 사람 상담원에게 연결하는 Function Tool이 있다. Tool이 실행되면 통화 정보와 연결 대상을 준비한 뒤, 여러 단계를 가진 Warm Transfer Task를 시작한다.
+
+문제는 Tool이 시작된 직후 환자가 “여보세요?”와 같은 짧은 말을 했을 때 발생했다.
+
+1. LLM이 상담원 연결 Tool을 호출한다.
+2. Tool이 로깅과 통화 데이터를 준비한다.
+3. 아직 Warm Transfer Task를 await하기 전에 환자가 말한다.
+4. 현재 SpeechHandle이 interrupted 상태가 된다.
+5. 이미 중단된 Function Tool 안에서 inline Task를 await하려 한다.
+6. SDK가 잘못된 생명주기를 감지하고 RuntimeError를 발생시킨다.
+
+<MermaidDiagram chart={`sequenceDiagram
+    participant Patient as 환자
+    participant Tool as transfer_call Tool
+    participant Speech as SpeechHandle
+    participant Task as Warm Transfer Task
+
+    Tool->>Tool: Tool 실행 시작
+    Tool->>Tool: 로깅 · 통화 데이터 준비
+    Patient-->>Speech: 여보세요?
+    Speech->>Speech: interrupted = true
+    Tool->>Task: await Task
+    Task--xTool: already interrupted RuntimeError`} />
+
+Task 안에서는 interruption을 막도록 설계했지만, **Tool 진입부터 Task await 직전까지 보호되지 않은 짧은 구간**이 남아 있었다. 비동기 시스템에서는 이 몇 밀리초의 틈도 실제 장애 조건이 된다.
+
+현재 구현에서는 되돌리기 어려운 상담원 연결 Tool에 들어가자마자 RunContext의 공개 API로 interruption을 제한한다.
+
+```python
+@function_tool()
+async def transfer_call(self, ctx: RunContext_T):
+    # Protect the transfer lifecycle before any preparatory work begins.
+    ctx.disallow_interruptions()
+
+    call_session_data = ctx.userdata
+    await self._handle_transfer_call(call_session_data=call_session_data)
+```
+
+핵심은 단순히 에러 한 줄을 막은 것이 아니다.
+
+- Tool이 시작되는 순간 interruption 정책을 결정한다.
+- 음성 재생 중단과 업무 취소를 같은 상태로 취급하지 않는다.
+- 되돌릴 수 없는 작업은 완료 또는 명시적인 실패까지 수명주기를 보호한다.
+- 읽기 작업처럼 취소 가능한 Tool은 interruption을 감지해 결과를 버릴 수 있게 만든다.
+- private SDK 내부 상태보다 현재 제공되는 RunContext API를 우선 사용한다.
+
+---
+
+## 10. 우리가 사용하고 있는 Turn Handling 조합
+
+글을 작성하는 현재, Wise AI 인바운드 에이전트의 핵심 설정은 다음과 같다. 설정값 자체보다 각각의 역할을 함께 보는 것이 중요하다.
+
+```python
+turn_handling=TurnHandlingOptions(
+    turn_detection=inference.TurnDetector(version="v1-mini"),
+    endpointing=EndpointingOptions(
+        mode="fixed",
+        min_delay=0.5,
+        max_delay=2.0,
+    ),
+    preemptive_generation=PreemptiveGenerationOptions(
+        enabled=True,
+        preemptive_tts=True,
+    ),
+    interruption=InterruptionOptions(
+        enabled=True,
+        mode="vad",
+        min_duration=0.2,
+        min_words=3,
+        false_interruption_timeout=0.5,
+        resume_false_interruption=True,
+        discard_audio_if_uninterruptible=True,
+    ),
+)
+```
+
+| 설정 | 현재 값 | 의도 |
+|---|---:|---|
+| VAD activation threshold | 0.65 | 전화 잡음과 실제 음성 사이의 시작 기준 조정 |
+| Turn Detector | v1-mini | 침묵만이 아니라 발화의 끝을 추가 판단 |
+| Endpointing | 0.5~2.0초 | 빠른 응답과 생각할 시간 사이의 범위 설정 |
+| Interruption mode | VAD | self-hosted 환경에서 빠른 음성 시작 감지 |
+| Minimum duration | 0.2초 | 매우 짧은 소리의 오탐 완화 |
+| Minimum words | 3 | AI가 맞장구에 과도하게 멈추는 현상 완화 |
+| False interruption timeout | 0.5초 | 오탐 후 빠르게 AI 발화 재개 |
+| Resume false interruption | 활성화 | 잡음 때문에 멈춘 안내를 이어서 재생 |
+| Preemptive generation | 활성화 | turn 확정 전 생성 작업을 시작해 체감 지연 단축 |
+
+이 값은 모든 Voice AI에 통하는 정답이 아니다. 병원 전화에는 “네”처럼 매우 짧지만 중요한 답이 많기 때문에, 예약 확인처럼 짧은 답이 필요한 구간에서는 interruption 정책을 다르게 적용할 수 있다. 반대로 긴 안내 중에는 맞장구가 새로운 turn으로 처리되지 않도록 더 보수적으로 판단할 수 있다.
+
+즉 설정은 session 전체에 하나만 두는 것이 아니라 **업무 단계와 질문 유형에 따라 달라질 수 있는 정책**으로 보는 편이 맞다.
+
+> **Version note:** LiveKit Agents의 turn handling API는 빠르게 발전하고 있다. 이 글의 설정 예시는 2026년 8월 현재 우리 서비스 구성에 맞춘 것이다. 새로 적용할 때는 사용 중인 SDK 버전의 [Turn handling options](https://docs.livekit.io/reference/agents/turn-handling-options/)를 확인해야 한다.
+
+---
+
+## 11. 자연스러움은 하나의 숫자로 측정되지 않는다
+
+Turn Handling을 조정할 때 평균 응답시간만 보면 중요한 문제를 놓친다. 0.3초 빠른 답변보다 환자의 말을 한 번 덜 끊는 것이 더 좋은 경험일 수 있다.
+
+우리는 다음과 같은 통화를 함께 살펴봐야 한다.
+
+- AI가 환자의 문장을 중간에 끊은 통화
+- 환자가 말했지만 VAD나 STT가 놓친 통화
+- “네”가 실제 답이었지만 무시된 통화
+- “음”이라는 맞장구 때문에 AI가 자주 멈춘 통화
+- false interruption 이후 음성을 재개하지 못한 통화
+- 같은 문장을 멈췄다가 재개하며 stutter가 발생한 통화
+- 예약이나 상담원 연결 Tool 실행 중 interrupt된 통화
+- 발화 종료부터 AI 첫 음성까지 지나치게 오래 걸린 통화
+
+테스트 환경도 다양해야 한다.
+
+- 조용한 실내와 소음이 큰 길거리
+- 이어폰과 스피커폰
+- 통신 상태가 좋거나 나쁜 전화망
+- 말이 빠른 사람과 중간 pause가 긴 사람
+- 짧은 대답이 많은 예약 확인 대화
+- 날짜, 생년월일과 전화번호를 길게 읽는 대화
+- AI의 말을 기다리지 않고 바로 끼어드는 사람
+
+기술적으로는 interruption rate, false interruption, endpointing delay와 응답 latency를 측정할 수 있다. 하지만 로그의 숫자는 실제 전사와 오디오 타임라인을 함께 볼 때 의미가 생긴다. 왜 멈췄는지, 환자가 무엇을 하려 했는지, 업무 결과가 보존됐는지를 확인해야 한다.
+
+---
+
+## 12. 좋은 Voice AI는 잘 말하기 전에 잘 기다린다
+
+Voice AI의 대화를 자연스럽게 만드는 일은 LLM의 문장을 다듬는 것만으로 끝나지 않는다.
+
+VAD는 환자가 말하기 시작한 순간을 빠르게 찾는다. Endpointing은 침묵 속에서 조금 더 기다릴지 결정한다. Turn Detector는 음성과 문장의 의미를 보고 대화 차례가 끝났는지 판단한다. Interruption은 환자가 다시 말할 때 AI에게 멈추라고 알린다. 그리고 Tool의 생명주기는 그 멈춤이 실제 업무를 망가뜨리지 않도록 보호한다.
+
+이 기술들은 모두 하나의 질문을 향한다.
+
+> 지금은 AI가 말할 차례인가, 아니면 환자의 말을 더 들어야 하는가?
+
+가장 빠르게 답하는 AI가 항상 가장 자연스러운 AI는 아니다. 환자가 아직 생각하는 중이면 기다리고, 환자가 끼어들면 멈추며, 중요한 업무가 진행 중이면 상태를 안전하게 지켜야 한다.
+
+**좋은 Voice AI는 잘 말하기 전에 잘 듣고, 잘 대답하기 전에 잘 기다린다.**
+
+---
+
+## 참고 자료
+
+- [LiveKit Turns overview](https://docs.livekit.io/agents/logic/turns/)
+- [LiveKit Turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/)
+- [LiveKit Turn-taking tuning](https://docs.livekit.io/agents/logic/turns/tuning/)
+- [LiveKit Adaptive interruption handling](https://docs.livekit.io/agents/logic/turns/adaptive-interruption-handling/)
+- [LiveKit Turn handling options](https://docs.livekit.io/reference/agents/turn-handling-options/)
+- [LiveKit Function tools](https://docs.livekit.io/agents/logic/tools/definition/)
