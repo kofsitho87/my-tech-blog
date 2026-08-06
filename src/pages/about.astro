@@ -1,0 +1,38 @@
+---
+import BaseHead from '../components/BaseHead.astro';
+import Footer from '../components/Footer.astro';
+import Header from '../components/Header.astro';
+import { GITHUB_URL, SITE_TITLE } from '../consts';
+---
+<!doctype html>
+<html lang="ko">
+	<head><BaseHead title={`소개 · ${SITE_TITLE}`} description="kofsitho87의 기술 블로그 소개" /></head>
+	<body>
+		<Header />
+		<main>
+			<article class="about reveal">
+				<header>
+					<p class="eyebrow">About this log</p>
+					<h1>안녕하세요.<br />만들며 배우는<br /><em>개발자입니다.</em></h1>
+				</header>
+				<div class="copy">
+					<p class="lead">복잡한 기술을 직접 실험하고, 다시 꺼내 쓸 수 있는 언어로 정리합니다.</p>
+					<p>이곳에는 프로젝트를 만들며 마주친 문제, 해결 과정, 새롭게 배운 개념을 기록합니다. 완벽한 정답보다 실제로 도움이 된 과정에 집중합니다.</p>
+					<p>아직 소개할 내용을 정하는 중이라면 이 문장을 자유롭게 바꿔 주세요. 이 페이지는 <code>src/pages/about.astro</code>에 있습니다.</p>
+					<a class="button" href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub에서 보기 ↗</a>
+				</div>
+			</article>
+		</main>
+		<Footer />
+	</body>
+</html>
+<style>
+	.about { min-height: 65vh; display: grid; grid-template-columns: 1.35fr 1fr; gap: 7vw; align-items: end; }
+	h1 { font-size: clamp(3rem, 7vw, 6rem); font-weight: 500; }
+	h1 em { color: var(--accent); font-weight: 400; }
+	.copy { max-width: 520px; padding-top: 2rem; border-top: 1px solid var(--ink); }
+	.lead { font-family: "Iowan Old Style", "Noto Serif KR", serif; font-size: 1.35rem; line-height: 1.55; }
+	.button { display: inline-block; margin-top: 1rem; padding: .75rem 1rem; color: var(--paper); background: var(--ink); text-decoration: none; }
+	.button:hover { background: var(--accent); color: var(--paper); }
+	@media (max-width: 720px) { .about { grid-template-columns: 1fr; gap: 2rem; } }
+</style>

@@ -1,0 +1,55 @@
+---
+import { getCollection } from 'astro:content';
+import BaseHead from '../../components/BaseHead.astro';
+import Footer from '../../components/Footer.astro';
+import FormattedDate from '../../components/FormattedDate.astro';
+import Header from '../../components/Header.astro';
+import { SITE_DESCRIPTION, SITE_TITLE, pathWithBase } from '../../consts';
+
+const posts = (await getCollection('blog')).sort((a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf());
+---
+<!doctype html>
+<html lang="ko">
+	<head><BaseHead title={`글 · ${SITE_TITLE}`} description={SITE_DESCRIPTION} /></head>
+	<body>
+		<Header />
+		<main>
+			<header class="page-head reveal">
+				<p class="eyebrow">Archive / {String(posts.length).padStart(2, '0')} entries</p>
+				<h1>글</h1>
+				<p>배우고, 만들고, 다시 설명하며 남긴 기록입니다.</p>
+			</header>
+			<section class="archive reveal reveal-delay">
+				{posts.map((post, index) => (
+					<article>
+						<span class="number">{String(index + 1).padStart(2, '0')}</span>
+						<div>
+							<h2><a href={pathWithBase(`blog/${post.id}/`)}>{post.data.title}</a></h2>
+							<p>{post.data.description}</p>
+						</div>
+						<time><FormattedDate date={post.data.pubDate} /></time>
+					</article>
+				))}
+			</section>
+		</main>
+		<Footer />
+	</body>
+</html>
+<style>
+	.page-head { display: grid; grid-template-columns: 1fr 2fr; align-items: end; gap: 2rem; padding-bottom: 5rem; }
+	.page-head h1 { grid-row: 2; margin: 0; }
+	.page-head > p:last-child { max-width: 430px; margin-bottom: 1rem; }
+	.archive { border-top: 2px solid var(--ink); }
+	article { display: grid; grid-template-columns: 50px 1fr auto; gap: 1.5rem; padding: 2.3rem 0; border-bottom: 1px solid var(--line); }
+	.number, time { color: var(--muted); font-size: .78rem; }
+	article h2 { font-size: clamp(1.5rem, 3vw, 2.4rem); }
+	article h2 a { color: var(--ink); text-decoration: none; }
+	article h2 a:hover { color: var(--accent); }
+	article p { color: var(--muted); margin: 0; }
+	@media (max-width: 650px) {
+		.page-head { grid-template-columns: 1fr; gap: .5rem; }
+		.page-head h1 { grid-row: auto; }
+		article { grid-template-columns: 30px 1fr; gap: .75rem; }
+		article time { grid-column: 2; }
+	}
+</style>

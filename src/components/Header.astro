@@ -1,0 +1,53 @@
+---
+import { GITHUB_URL, SITE_TITLE, pathWithBase } from '../consts';
+import HeaderLink from './HeaderLink.astro';
+---
+
+<header>
+	<nav>
+		<a class="brand" href={pathWithBase()} aria-label="홈으로 이동">
+			<span class="prompt" aria-hidden="true">~/</span>{SITE_TITLE}
+		</a>
+		<div class="internal-links">
+			<HeaderLink href={pathWithBase()}>홈</HeaderLink>
+			<HeaderLink href={pathWithBase('blog/')}>글</HeaderLink>
+			<HeaderLink href={pathWithBase('about/')}>소개</HeaderLink>
+		</div>
+		<a class="github" href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub ↗</a>
+	</nav>
+</header>
+<style>
+	header {
+		position: relative;
+		z-index: 10;
+		border-bottom: 1px solid var(--line);
+	}
+	nav {
+		max-width: var(--page);
+		margin: 0 auto;
+		padding: 1.2rem 1.5rem;
+		display: flex;
+		align-items: center;
+		gap: 2.25rem;
+	}
+	.brand, .github {
+		color: var(--ink);
+		text-decoration: none;
+	}
+	.brand { font-weight: 700; letter-spacing: -.02em; }
+	.prompt { color: var(--accent); margin-right: .2rem; }
+	.internal-links { display: flex; gap: 1.35rem; margin-left: auto; }
+	.github {
+		font-size: .8rem;
+		letter-spacing: .08em;
+		text-transform: uppercase;
+		border: 1px solid var(--line);
+		padding: .45rem .7rem;
+	}
+	.github:hover { border-color: var(--accent); color: var(--accent); }
+	@media (max-width: 600px) {
+		nav { gap: 1rem; padding-inline: 1rem; }
+		.internal-links { gap: .8rem; }
+		.github { display: none; }
+	}
+</style>

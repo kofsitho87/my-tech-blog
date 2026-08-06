@@ -1,0 +1,112 @@
+:root {
+	--paper: #f4f1e8;
+	--paper-deep: #ebe6d9;
+	--ink: #17211b;
+	--muted: #667069;
+	--accent: #df5b31;
+	--accent-soft: #f2c8b8;
+	--line: rgba(23, 33, 27, 0.18);
+	--page: 1120px;
+	--reading: 720px;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+	margin: 0;
+	background-color: var(--paper);
+	background-image:
+		linear-gradient(rgba(23, 33, 27, .025) 1px, transparent 1px),
+		linear-gradient(90deg, rgba(23, 33, 27, .025) 1px, transparent 1px);
+	background-size: 28px 28px;
+	color: var(--ink);
+	font-family: var(--font-atkinson), "Apple SD Gothic Neo", sans-serif;
+	font-size: 18px;
+	line-height: 1.75;
+	word-wrap: break-word;
+	overflow-wrap: break-word;
+}
+
+main {
+	width: 100%;
+	max-width: var(--page);
+	margin: 0 auto;
+	padding: 5rem 1.5rem;
+}
+
+h1, h2, h3, h4, h5, h6 {
+	margin: 0 0 .65rem;
+	font-family: "Iowan Old Style", "Noto Serif KR", serif;
+	line-height: 1.12;
+	letter-spacing: -.035em;
+}
+
+h1 { font-size: clamp(3rem, 8vw, 6.8rem); }
+h2 { font-size: clamp(2rem, 5vw, 3.5rem); }
+h3 { font-size: 1.65rem; }
+
+a { color: var(--accent); text-underline-offset: .2em; }
+a:hover { color: var(--ink); }
+p { margin: 0 0 1.25rem; }
+strong, b { font-weight: 700; }
+img { max-width: 100%; height: auto; }
+
+code {
+	padding: .14em .4em;
+	background: var(--paper-deep);
+	border: 1px solid var(--line);
+	font-size: .88em;
+}
+
+pre {
+	padding: 1.4rem;
+	border: 1px solid var(--line);
+	border-radius: 0;
+	overflow-x: auto;
+}
+pre > code { all: unset; }
+blockquote {
+	margin: 2rem 0;
+	padding-left: 1.25rem;
+	border-left: 3px solid var(--accent);
+	font-family: "Iowan Old Style", "Noto Serif KR", serif;
+	font-size: 1.25rem;
+}
+hr { border: 0; border-top: 1px solid var(--line); }
+
+.eyebrow {
+	color: var(--accent);
+	font-size: .75rem;
+	font-weight: 700;
+	letter-spacing: .16em;
+	text-transform: uppercase;
+}
+
+.prose p { margin-bottom: 1.5rem; }
+.prose h2, .prose h3 { margin-top: 2.8rem; }
+
+@media (prefers-reduced-motion: no-preference) {
+	.reveal { animation: rise .7s both cubic-bezier(.2,.7,.2,1); }
+	.reveal-delay { animation-delay: .12s; }
+	@keyframes rise {
+		from { opacity: 0; transform: translateY(18px); }
+		to { opacity: 1; transform: translateY(0); }
+	}
+}
+
+@media (max-width: 720px) {
+	body { font-size: 16px; }
+	main { padding: 3.5rem 1rem; }
+}
+
+.sr-only {
+	position: absolute !important;
+	width: 1px; height: 1px;
+	padding: 0; margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
