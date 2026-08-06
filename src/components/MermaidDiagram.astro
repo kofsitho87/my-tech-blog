@@ -1,0 +1,57 @@
+---
+interface Props {
+	chart: string;
+}
+
+const { chart } = Astro.props;
+---
+
+<div class="mermaid-diagram" data-chart={chart} aria-label="시스템 구성도"></div>
+
+<script>
+	import mermaid from 'mermaid';
+
+	mermaid.initialize({
+		startOnLoad: false,
+		theme: 'base',
+		securityLevel: 'strict',
+		themeVariables: {
+			background: '#f4f1e8',
+			primaryColor: '#ebe6d9',
+			primaryBorderColor: '#17211b',
+			primaryTextColor: '#17211b',
+			lineColor: '#667069',
+			secondaryColor: '#f2c8b8',
+			tertiaryColor: '#f4f1e8',
+			fontFamily: 'Atkinson, Apple SD Gothic Neo, sans-serif',
+		},
+	});
+
+	for (const element of document.querySelectorAll<HTMLElement>('.mermaid-diagram[data-chart]')) {
+		const chart = element.dataset.chart;
+		if (!chart) continue;
+		try {
+			const { svg } = await mermaid.render(`diagram-${crypto.randomUUID()}`, chart);
+			element.innerHTML = svg;
+		} catch {
+			element.textContent = '도식을 불러오지 못했습니다.';
+		}
+	}
+</script>
+
+<style>
+	.mermaid-diagram {
+		margin: 2.25rem 0;
+		overflow-x: auto;
+		padding: 1rem;
+		border: 1px solid var(--line);
+		background: var(--paper-deep);
+	}
+	.mermaid-diagram :global(svg) {
+		display: block;
+		min-width: 620px;
+		max-width: 100%;
+		height: auto;
+		margin: 0 auto;
+	}
+</style>

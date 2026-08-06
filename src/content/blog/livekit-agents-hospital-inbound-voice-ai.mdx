@@ -1,0 +1,328 @@
+---
+title: '전화받는 AI는 어떻게 만들어질까? LiveKit Agents로 구축한 병원 인바운드 Voice AI'
+description: 'LiveKit과 LiveKit Agents의 핵심 개념부터 SIP 전화 연결, STT–LLM–TTS 파이프라인, 병원 인바운드 Voice AI의 구조와 운영 과제까지 소개합니다.'
+pubDate: '2026-08-06'
+heroImage: '../../assets/blog/livekit-hospital-voice-ai-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+## 1. 챗봇이 아니라, 전화받는 AI
+
+텍스트 챗봇을 만들 때는 사용자가 메시지를 보내고 답변이 도착할 때까지 몇 초를 기다려도 크게 어색하지 않다. 하지만 전화는 다르다. 상대방이 말을 마쳤는데 아무 소리도 들리지 않으면 연결이 끊겼다고 생각하고, 답변 도중 끼어들었는데 상담원이 계속 말하면 대화가 통하지 않는다고 느낀다.
+
+전화 상담 AI에서 음성은 단순한 입력과 출력 형식이 아니다. **지연시간, 침묵, 말 끊기, 통화 연결과 종료까지 모두 대화 경험의 일부**다.
+
+우리는 병원으로 걸려 오는 전화를 받아 다음과 같은 업무를 처리하는 인바운드 Voice AI를 만들고 있다.
+
+- 병원의 첫 안내 메시지와 녹취 고지 재생
+- 음성 또는 DTMF 키패드를 통한 요청 분류
+- 진료 예약 가능 일정 조회와 예약 접수
+- 기존 예약 조회, 변경, 취소
+- 병원 운영시간과 자주 묻는 질문 안내
+- 필요한 경우 사람 상담원에게 연결
+- 통화 녹취와 대화 이벤트를 후속 분석 시스템으로 전달
+
+이 서비스의 실시간 통신 기반이 **LiveKit**이고, 그 위에서 AI의 듣기·생각하기·말하기를 연결하는 프레임워크가 **LiveKit Agents**다.
+
+> **TL;DR**
+>
+> - **LiveKit**은 음성·영상·데이터가 오가는 실시간 통신 공간을 제공한다.
+> - **LiveKit Agents**는 AI 프로그램이 그 공간에 참가해 사용자의 말을 듣고 응답하며 도구를 실행하도록 돕는다.
+> - 전화 사용자는 SIP를 통해 LiveKit Room에 들어오고, AI Agent도 같은 Room에 참가한다.
+> - 우리는 이 구조 위에 예약, FAQ, DTMF, 상담원 연결, 녹취, 통화 후 분석을 결합했다.
+> - 실제 품질을 결정하는 것은 LLM만이 아니라 턴 감지, 끼어들기, 지연시간, 종료 처리 같은 실시간 시스템 설계다.
+
+---
+
+## 2. LiveKit은 어떤 서비스인가
+
+LiveKit은 음성, 영상, 데이터를 실시간으로 주고받는 애플리케이션을 만들기 위한 오픈소스 프레임워크이자 클라우드 플랫폼이다. 내부적으로는 WebRTC 기반의 실시간 미디어 전송과 라우팅, 세션 관리, 네트워크 변화 대응 같은 복잡한 문제를 처리한다.
+
+웹 화상회의를 떠올리면 이해하기 쉽지만, LiveKit의 범위는 화상회의에 한정되지 않는다. 브라우저와 모바일 앱은 물론이고, 전화망과 연결된 음성 상담 서비스나 실시간 AI Assistant도 같은 통신 모델로 만들 수 있다.
+
+LiveKit을 이해할 때 가장 중요한 개념은 `Room`, `Participant`, `Track` 세 가지다.
+
+| 개념 | 의미 | 병원 전화 AI에서의 예 |
+|---|---|---|
+| `Room` | 실시간 통신이 이루어지는 하나의 세션 | 환자 한 명의 전화 통화 |
+| `Participant` | Room에 들어와 통신하는 사용자 또는 프로그램 | 환자, AI Agent, 사람 상담원 |
+| `Track` | Participant가 발행하거나 구독하는 미디어 스트림 | 환자의 음성, AI가 생성한 음성 |
+
+LiveKit 공식 문서에서도 Room을 실시간 통신이 일어나는 가상 공간, Participant를 사용자·AI Agent·SIP 전화 사용자 같은 참여 주체, Track을 음성·영상·데이터 스트림으로 정의한다. 이 모델의 장점은 전화 사용자와 AI를 전혀 다른 종류의 시스템으로 취급하지 않고, **같은 실시간 공간에 참여하는 주체**로 표현할 수 있다는 것이다.
+
+<MermaidDiagram chart={`flowchart LR
+    subgraph R["LiveKit Room — 한 건의 통화"]
+        P["환자<br/>SIP Participant"]
+        A["Voice AI<br/>Agent Participant"]
+        H["상담원<br/>SIP Participant"]
+
+        P <-->|"audio track"| A
+        P -. "필요할 때 연결" .-> H
+    end`} />
+
+일반적인 HTTP 요청은 요청과 응답이 한 번씩 오가면 끝난다. 반면 음성 통화는 연결된 동안 오디오가 계속 흐르고, 참가자의 상태도 지속해서 변한다. LiveKit은 이 실시간 상태와 미디어 전송을 애플리케이션 코드가 다루기 쉬운 형태로 제공한다.
+
+참고: [About LiveKit](https://docs.livekit.io/intro/about/), [Rooms, participants, and tracks](https://docs.livekit.io/intro/basics/rooms-participants-tracks/)
+
+---
+
+## 3. LiveKit과 LiveKit Agents는 무엇이 다른가
+
+두 이름은 비슷하지만 맡는 역할은 다르다.
+
+**LiveKit**이 실시간 통신을 위한 공간과 연결을 제공한다면, **LiveKit Agents**는 그 공간에서 AI가 대화하고 업무를 수행하도록 만드는 애플리케이션 프레임워크다.
+
+| LiveKit | LiveKit Agents |
+|---|---|
+| Room과 Participant 관리 | AI Agent와 AgentSession 관리 |
+| 실시간 음성·영상·데이터 전송 | STT, LLM, TTS 파이프라인 연결 |
+| WebRTC 연결과 네트워크 대응 | 발화 시작·종료와 대화 턴 판단 |
+| SIP 전화 사용자를 Room에 연결 | 끼어들기와 AI 음성 재생 제어 |
+| 미디어 Track 발행과 구독 | 도구 호출, 상태 관리, 대화 로직 |
+| 녹화·녹음 및 세션 이벤트 | Agent server와 통화별 job 실행 |
+
+쉽게 비유하면 LiveKit은 **전화가 연결되고 음성이 오가는 통화실**이고, LiveKit Agents는 **그 통화실에 들어가 환자의 말을 듣고 필요한 업무를 수행하는 AI 상담원**이다.
+
+LiveKit Agents로 작성한 Python 또는 Node.js 프로그램은 Room에 Participant로 참가할 수 있다. Agent는 사용자의 오디오를 받아 AI 모델로 처리하고, 생성한 음성을 다시 Room에 발행한다. 프레임워크는 STT, LLM, TTS뿐 아니라 턴 감지, interruption, tool calling, Agent lifecycle처럼 Voice AI에서 반복적으로 필요한 기능을 제공한다.
+
+참고: [LiveKit Agents introduction](https://docs.livekit.io/agents/)
+
+---
+
+## 4. 일반 전화는 어떻게 AI와 연결되는가
+
+병원에 전화하는 환자는 웹 브라우저나 LiveKit 앱을 사용하지 않는다. 평소처럼 휴대전화에서 병원 번호를 누를 뿐이다. 이 전화를 LiveKit의 실시간 Room으로 가져오는 연결 고리가 **SIP(Session Initiation Protocol)**다.
+
+SIP는 인터넷 전화에서 통화를 시작하고 관리하고 종료하기 위한 표준 프로토콜이다. 일반 전화망(PSTN)에서 들어온 전화는 통신사 또는 SIP trunk provider를 거쳐 LiveKit SIP endpoint로 전달된다.
+
+<MermaidDiagram chart={`sequenceDiagram
+    autonumber
+    actor Caller as 환자
+    participant PSTN as 전화망 / SIP Provider
+    participant LK as LiveKit
+    participant Server as Agent Server
+    participant Agent as Voice AI Agent
+
+    Caller->>PSTN: 병원 대표번호로 전화
+    PSTN->>LK: SIP INVITE
+    LK->>LK: Dispatch Rule로 Room 생성·배정
+    LK->>Server: 통화 처리를 위한 job 요청
+    Server->>Agent: 통화별 AgentSession 시작
+    Agent->>LK: Room에 Agent로 참가
+    LK-->>Caller: AI 음성 안내 시작`} />
+
+LiveKit에서는 inbound trunk가 어떤 전화를 받을지 정의하고, dispatch rule이 들어온 전화를 어떤 Room과 Agent로 보낼지 결정한다. 연결된 환자는 LiveKit에서 `SIP Participant`로 표현된다. 이후 AI Agent가 같은 Room에 참가하면 양쪽의 오디오가 실시간으로 오갈 수 있다.
+
+이 구조 덕분에 Agent의 대화 로직은 환자가 전화망에서 왔는지, 웹 애플리케이션에서 마이크로 접속했는지에 강하게 결합되지 않는다. 통신 채널의 차이는 LiveKit이 흡수하고, Agent는 Room 안에서 전달되는 오디오와 상태에 집중할 수 있다.
+
+참고: [SIP primer](https://docs.livekit.io/reference/telephony/sip-primer/), [Accepting calls](https://docs.livekit.io/telephony/accepting-calls/)
+
+---
+
+## 5. AI는 어떻게 듣고, 생각하고, 말하는가
+
+Voice AI를 처음 접하면 하나의 AI 모델이 음성을 듣고 바로 음성으로 답한다고 생각하기 쉽다. 실제로 speech-to-speech realtime model을 사용할 수도 있지만, 우리는 현재 역할을 분리한 **STT–LLM–TTS 파이프라인**을 중심으로 구성하고 있다.
+
+<MermaidDiagram chart={`flowchart LR
+    U["환자 음성"] --> VAD["VAD / Turn Detection<br/>언제 말이 끝났는가"]
+    VAD --> STT["STT<br/>음성 → 텍스트"]
+    STT --> LLM["LLM<br/>의도 판단·응답 생성"]
+    LLM -->|"필요한 경우"| TOOL["Tools / Tasks<br/>예약·FAQ·전환"]
+    TOOL --> LLM
+    LLM --> TTS["TTS<br/>텍스트 → 음성"]
+    TTS --> U2["환자에게 재생"]`} />
+
+### STT: 환자의 말을 텍스트로 바꾸기
+
+Speech-to-Text 모델은 Room에서 들어오는 환자의 오디오를 실시간으로 받아 텍스트로 변환한다. 전화 음성에는 주변 소음, 작은 목소리, 고유명사, 병원명과 의사명처럼 인식하기 어려운 표현이 많기 때문에 단순 정확도뿐 아니라 streaming 성능과 언어별 품질도 중요하다.
+
+### LLM: 대화를 이해하고 다음 행동 결정하기
+
+LLM은 변환된 텍스트와 지금까지의 대화, 병원 설정을 바탕으로 응답을 생성한다. 다만 실제 서비스에서 LLM의 역할은 문장을 만드는 데 그치지 않는다. 예약 요청이라면 예약 도구를 호출하고, 병원 정보 질문이라면 주어진 FAQ 안에서 답하며, 사람이 필요한 상황이라면 연결 흐름으로 이동해야 한다.
+
+### Tools와 Tasks: 말이 실제 업무가 되는 지점
+
+“예약해 드릴게요”라고 말하는 것과 실제 예약 API를 호출해 예약을 완료하는 것은 전혀 다른 문제다. Tools와 Tasks는 LLM의 의도를 검증 가능한 시스템 작업으로 연결한다.
+
+예를 들어 예약 작업은 다음과 같이 진행된다.
+
+1. 환자가 원하는 진료과, 의료진, 날짜와 시간 조건을 수집한다.
+2. 예약 API에서 실제 가능한 일정을 조회한다.
+3. 선택 가능한 후보만 환자에게 안내한다.
+4. 환자의 최종 확인을 받은 뒤 예약을 등록한다.
+5. API 결과를 대화 이벤트에 기록한다.
+
+### TTS: 텍스트를 통화 가능한 음성으로 바꾸기
+
+Text-to-Speech 모델은 LLM의 답변이나 미리 정한 안내 문구를 음성으로 생성한다. 전화에서는 자연스러운 목소리뿐 아니라 첫 음성이 얼마나 빨리 시작되는지, 숫자·날짜·시간을 얼마나 정확하게 읽는지, 생성된 음성을 중간에 멈출 수 있는지가 중요하다.
+
+단계별 파이프라인은 각 모델을 독립적으로 선택할 수 있고, 전사와 tool call 기록을 남기기 쉬우며, 문제 발생 시 어느 단계에서 지연이나 오류가 생겼는지 추적하기 좋다. 대신 각 단계의 지연이 누적될 수 있으므로 streaming과 선행 생성 같은 최적화가 필요하다.
+
+참고: [Voice pipeline types](https://docs.livekit.io/agents/models/pipelines/)
+
+---
+
+## 6. 우리가 구축한 병원 인바운드 Voice AI
+
+우리 서비스에서 LiveKit은 환자와 AI를 실시간으로 연결하는 통신 계층이다. 그 위의 업무 계층에서는 병원별 설정과 환자 요청에 따라 통화 흐름을 실행한다.
+
+현재 런타임의 중심에는 `AgentServer`, `AgentSession`, `SingleAgent`가 있다.
+
+- `AgentServer`는 LiveKit에 등록된 상태로 통화 요청을 기다리고 통화별 job을 시작한다.
+- `AgentSession`은 STT, LLM, TTS, VAD, 턴 감지와 interruption 설정을 하나의 실시간 대화 세션으로 묶는다.
+- `SingleAgent`는 병원별 `flow_config`를 따라 안내와 조건 분기를 처리하고, 예약·FAQ·상담원 연결에 필요한 Tool과 Task를 실행한다.
+
+<MermaidDiagram chart={`flowchart TB
+    C["환자 전화"] --> SIP["SIP / LiveKit Telephony"]
+    SIP --> ROOM["LiveKit Room"]
+    ROOM --> AS["AgentServer<br/>통화별 job"]
+    AS --> SESSION["AgentSession<br/>STT · LLM · TTS · Turn Handling"]
+    SESSION --> SA["SingleAgent<br/>flow_config 실행"]
+
+    SA --> DTMF["Greeting / DTMF"]
+    SA --> BOOK["예약 Tools & Tasks"]
+    SA --> FAQ["병원 FAQ"]
+    SA --> TRANSFER["상담원 연결<br/>Warm / Cold Transfer"]
+
+    BOOK --> API["예약 API"]
+    FAQ --> INFO["병원 정보 시스템"]
+    TRANSFER --> HUMAN["사람 상담원"]
+
+    ROOM --> REC["통화 녹취<br/>LiveKit Egress → S3"]
+    SESSION --> KAFKA["대화·도구 이벤트<br/>Kafka"]
+    KAFKA --> ANALYSIS["통화 후 분석<br/>분류 · 요약 · 품질 지표"]`} />
+
+### 병원별 통화 흐름은 설정으로 제어한다
+
+모든 병원이 같은 방식으로 전화를 받지는 않는다. 어떤 병원은 첫 안내에서 “예약은 1번”이라는 DTMF 메뉴가 필요하고, 다른 병원은 환자가 바로 말하도록 하고 싶어 한다. 업무시간과 비업무시간의 연결 정책도 다르고, 예약과 정보 문의 처리 방식도 다르다.
+
+이 차이를 코드에 하드코딩하면 병원이 추가되거나 정책이 바뀔 때마다 배포가 필요하다. 그래서 통화의 큰 흐름은 `flow_config`로 정의한다.
+
+`flow_config`에는 다음과 같은 노드가 들어갈 수 있다.
+
+- `greeting`: 안내 메시지를 재생하고 필요한 경우 DTMF를 받는다.
+- `condition`: 업무시간이나 세션 값에 따라 다음 경로를 고른다.
+- `agent`: AI가 자유 대화를 처리하는 구간으로 진입한다.
+- `action`: 상담원 연결이나 로그 기록 같은 동작을 실행한다.
+- `exit`: 종료 안내 후 세션을 안전하게 닫는다.
+
+이렇게 하면 **무엇을 어떤 순서로 실행할지**는 설정으로 제어하고, **환자의 자연어를 어떻게 이해하고 응답할지**는 LLM과 Agent가 담당할 수 있다.
+
+### DTMF와 자유 대화를 함께 사용한다
+
+Voice AI라고 해서 모든 입력을 음성으로만 받을 필요는 없다. DTMF는 본인 확인 숫자, 메뉴 선택, 재생 요청처럼 정확성이 중요한 입력에서 여전히 유용하다. 반대로 “다음 주 월요일 오후에 정형외과 예약하고 싶어요” 같은 요청은 자유 대화가 훨씬 자연스럽다.
+
+우리 서비스는 두 방식을 경쟁 관계로 보지 않는다.
+
+- 결정성이 중요한 구간: DTMF와 명시적인 조건 분기
+- 자연어 이해가 중요한 구간: LLM 기반 대화와 Tool 호출
+
+환자는 익숙한 전화 경험을 유지하면서도, 복잡한 요청에서는 정해진 메뉴를 여러 단계 통과하지 않고 바로 말할 수 있다.
+
+### 통화가 끝난 뒤에도 처리는 계속된다
+
+실시간 Agent의 업무는 통화 종료와 함께 끝나지만, 서비스의 업무는 끝나지 않는다. 설정에 따라 LiveKit Egress로 녹취를 저장하고, 대화 내용과 tool 실행 이벤트를 Kafka에 발행한다. 후속 분석 파이프라인은 이를 이용해 통화를 분류하고 요약하며, 예약 전환이나 연결 결과, 오류 패턴 같은 품질 지표를 만든다.
+
+이 분리는 중요한 장점이 있다. 실시간 통화 중에는 응답 속도에 집중하고, 비용이 크거나 시간이 오래 걸리는 분석은 통화가 끝난 뒤 비동기로 처리할 수 있다.
+
+---
+
+## 7. 실제 Voice AI의 어려움은 LLM 밖에 있다
+
+좋은 LLM을 연결했다고 좋은 전화 상담 서비스가 완성되지는 않는다. 실제 개발 과정에서 더 많은 시간이 필요한 부분은 대화의 경계와 비동기 상태를 다루는 일이었다.
+
+### “말이 끝났다”는 것을 어떻게 알 수 있을까
+
+단순한 Voice Activity Detection(VAD)은 소리가 있는지 없는지는 판단할 수 있지만, 문장이 끝났는지는 이해하지 못한다. 환자가 “다음 주… 잠시만요… 수요일이요”라고 말할 때, 중간 침묵을 턴 종료로 오인하면 AI가 먼저 대답하기 시작한다.
+
+LiveKit Agents의 turn detection과 endpointing은 음성 활동, 문맥, 대기 시간을 조합해 사용자 턴의 끝을 판단한다. 우리는 최소·최대 endpointing 시간과 turn detector를 조정하면서, 너무 성급하게 답하지 않으면서도 침묵이 길어지지 않는 균형을 찾고 있다.
+
+참고: [Turn detection](https://docs.livekit.io/agents/logic/turns/turn-detector/)
+
+### 끼어들기는 기능이 아니라 대화 규칙이다
+
+사람은 상대방의 말이 끝날 때까지 항상 기다리지 않는다. “아니요, 오전 말고 오후요”처럼 AI의 답변을 중간에 수정하기도 한다. 이때 Agent는 현재 재생 중인 음성을 멈추고 새 요청을 처리해야 한다.
+
+그러나 짧은 맞장구, 기침, 배경 소음을 모두 interruption으로 처리하면 AI의 말이 계속 끊긴다. 그래서 최소 발화 시간과 단어 수, false interruption 복구 같은 정책이 필요하다. 특히 예약 확정 안내나 녹취 고지처럼 중간에 잘리면 안 되는 문장은 일반 대화와 다른 interruption 정책을 사용할 수 있어야 한다.
+
+참고: [Turns and interruptions](https://docs.livekit.io/agents/logic/turns/)
+
+### 지연시간은 여러 단계에서 조금씩 쌓인다
+
+환자가 말을 마친 뒤 AI의 첫 음성이 나오기까지는 여러 작업이 지나간다.
+
+```text
+턴 종료 판단 + STT 확정 + LLM 첫 토큰 + Tool/API + TTS 첫 오디오
+```
+
+어느 한 단계가 특별히 느리지 않아도 합산된 지연은 길어질 수 있다. 우리는 각 단계의 지표를 따로 측정하고, streaming TTS와 preemptive generation을 사용하며, 통화 전에 준비할 수 있는 모델과 데이터를 미리 로드한다. 외부 API를 호출하는 동안에는 무작정 침묵하기보다 필요한 경우 짧은 진행 안내를 제공한다.
+
+### 통화 종료는 하나의 이벤트가 아니다
+
+사용자가 전화를 끊는 순간에는 여러 작업이 동시에 진행 중일 수 있다. AI 음성 재생, 예약 API 호출, 녹취 파일 종료, Room 정리, Kafka 이벤트 발행이 서로 다른 비동기 작업으로 움직인다.
+
+종료 처리가 느리면 worker가 불필요하게 남고, 너무 빠르면 마지막 음성이나 분석 이벤트가 유실될 수 있다. 그래서 사용자 disconnect, AgentSession shutdown, 녹취 종료, 후속 이벤트 발행의 순서와 중복 실행 방지를 명시적으로 설계해야 한다.
+
+### 상담원 연결은 Participant가 바뀌는 분산 시스템 문제다
+
+Cold transfer는 통화를 사람에게 넘기고 AI가 빠지는 방식이다. Warm transfer는 AI가 상담원에게 먼저 연결해 상황을 전달하거나, 환자와 상담원이 안전하게 이어질 때까지 중간 단계를 관리한다.
+
+Warm transfer 중에는 환자, AI, 상담원이 한 통화의 서로 다른 상태에 놓인다. 누가 누구의 음성을 듣는지, 연결 실패 시 어디로 복귀할지, 동시에 여러 연결 시도가 들어오면 어떻게 막을지를 관리해야 한다. 실제 구현에서는 단순한 전화번호 전달보다 상태 머신과 동시성 제어가 더 중요하다.
+
+---
+
+## 8. LiveKit이 잘 맞았던 이유와 남은 과제
+
+LiveKit과 LiveKit Agents는 실시간 통신부터 AI 대화 파이프라인까지 비교적 일관된 모델을 제공한다. 특히 우리 서비스에는 다음 특성이 잘 맞았다.
+
+### 잘 맞았던 점
+
+- **전화와 AI의 연결 모델이 명확하다.** 환자, AI, 상담원을 Participant로 다룰 수 있다.
+- **기존 전화망을 유지할 수 있다.** 환자는 새 앱을 설치하지 않고 병원 번호로 전화한다.
+- **AI 모델을 조합할 수 있다.** STT, LLM, TTS를 목적과 언어에 맞게 교체할 수 있다.
+- **Python 업무 로직과 연결하기 쉽다.** 예약 API와 병원 설정, Tool과 Task를 Agent 코드 안에서 통합할 수 있다.
+- **실시간 대화 기능이 프레임워크에 포함된다.** 턴 감지, interruption, audio playout, transcription을 처음부터 직접 만들 필요가 없다.
+- **통화별 실행 단위가 분리된다.** Agent server가 각 통화를 별도의 job으로 실행해 상태와 장애 범위를 나눌 수 있다.
+
+LiveKit Agent server는 LiveKit에 등록된 뒤 dispatch 요청을 기다리고, 요청을 받으면 통화 처리를 위한 job을 시작한다. 하나의 서버가 여러 job을 처리하되 각각을 별도 프로세스로 실행할 수 있어 통화 간 격리에 유리하다.
+
+참고: [Agent server lifecycle](https://docs.livekit.io/agents/server/lifecycle/)
+
+### 여전히 직접 해결해야 하는 점
+
+- 어떤 STT·LLM·TTS 조합이 한국어 전화 환경에 적합한지 평가해야 한다.
+- 모델 정확도, 지연시간, 비용 사이에서 서비스별 균형을 찾아야 한다.
+- 병원명, 진료과, 의사명, 날짜와 시간 같은 도메인 표현을 안정적으로 처리해야 한다.
+- 전화망과 SIP provider의 연결 특성까지 포함한 end-to-end 테스트가 필요하다.
+- 예약 확정과 상담원 연결처럼 되돌리기 어려운 작업에는 별도의 검증과 확인 절차가 필요하다.
+- 녹취와 개인정보를 다루는 보안·보존 정책을 서비스 수준에서 설계해야 한다.
+
+LiveKit은 실시간 통신과 Agent 실행을 위한 강력한 기반이지만, 병원 업무의 정확성과 안전성까지 자동으로 해결해 주는 완제품은 아니다. 좋은 Voice AI는 통신 인프라, AI 모델, 업무 규칙, 운영 관측성이 함께 맞물릴 때 만들어진다.
+
+---
+
+## 9. 마치며: AI가 실시간 통화의 참가자가 된다는 것
+
+LiveKit을 사용하면서 가장 유용했던 관점은 AI를 단순한 API가 아니라 **실시간 통화에 참여하는 하나의 Participant**로 보는 것이었다.
+
+환자와 AI가 같은 Room에 들어오고, 서로의 음성을 Track으로 주고받는다. LiveKit Agents는 그 위에서 듣기, 턴 판단, 응답 생성, 음성 재생, Tool 실행을 이어 준다. 그리고 우리의 서비스 로직은 이 Agent가 실제 병원 업무를 안전하게 수행하도록 예약, 정보 안내, DTMF, 상담원 연결, 녹취와 후속 분석을 결합한다.
+
+결국 전화받는 AI의 품질은 “어떤 LLM을 사용했는가” 하나로 설명되지 않는다. 환자가 언제 말을 마쳤는지 알아차리고, 필요한 순간에는 말을 멈추고, 실제 가능한 일정만 안내하고, 통화가 끊겼을 때 데이터를 잃지 않는 모든 과정이 함께 작동해야 한다.
+
+LiveKit은 그 복잡한 과정에서 실시간 통신이라는 토대를 제공한다. LiveKit Agents는 그 토대 위에서 AI를 대화 가능한 참가자로 만든다. 우리는 그 위에 병원마다 다른 업무 흐름과 운영 규칙을 쌓아, 단순히 질문에 답하는 AI가 아니라 **전화를 받고 실제 업무를 수행하는 Voice AI**를 만들어 가고 있다.
+
+다음 글에서는 이 시스템에서 LLM의 자유로운 대화와 결정적인 통화 흐름을 어떻게 결합했는지, `flow_config` 기반 아키텍처를 중심으로 더 자세히 살펴볼 예정이다.
+
+---
+
+## References
+
+- [LiveKit: About LiveKit](https://docs.livekit.io/intro/about/)
+- [LiveKit: Rooms, participants, and tracks](https://docs.livekit.io/intro/basics/rooms-participants-tracks/)
+- [LiveKit Agents: Introduction](https://docs.livekit.io/agents/)
+- [LiveKit Telephony: SIP primer](https://docs.livekit.io/reference/telephony/sip-primer/)
+- [LiveKit Telephony: Accepting calls](https://docs.livekit.io/telephony/accepting-calls/)
+- [LiveKit Agents: Pipeline types](https://docs.livekit.io/agents/models/pipelines/)
+- [LiveKit Agents: Turn detector](https://docs.livekit.io/agents/logic/turns/turn-detector/)
+- [LiveKit Agents: Server lifecycle](https://docs.livekit.io/agents/server/lifecycle/)
