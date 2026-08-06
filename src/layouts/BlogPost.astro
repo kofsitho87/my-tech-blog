@@ -9,11 +9,32 @@ import Header from '../components/Header.astro';
 type Props = CollectionEntry<'blog'>['data'];
 
 const { title, description, pubDate, updatedDate, heroImage } = Astro.props;
+const canonicalURL = new URL(Astro.url.pathname, Astro.site);
+const articleSchema = {
+	'@context': 'https://schema.org',
+	'@type': 'BlogPosting',
+	headline: title,
+	description,
+	datePublished: pubDate.toISOString(),
+	dateModified: (updatedDate ?? pubDate).toISOString(),
+	mainEntityOfPage: canonicalURL.href,
+	url: canonicalURL.href,
+	image: heroImage ? new URL(heroImage.src, Astro.site).href : undefined,
+	author: {
+		'@type': 'Person',
+		name: 'kofsitho87',
+	},
+	publisher: {
+		'@type': 'Organization',
+		name: 'kofsitho87.log',
+	},
+};
 ---
 
 <html lang="ko">
 	<head>
-		<BaseHead title={title} description={description} />
+		<BaseHead title={title} description={description} image={heroImage} type="article" />
+		<script type="application/ld+json" set:html={JSON.stringify(articleSchema)} />
 		<style>
 			main {
 				max-width: 100%;

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://kofsitho87.github.io/my-tech-blog/sitemap-index.xml

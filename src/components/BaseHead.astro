@@ -11,11 +11,20 @@ interface Props {
 	title: string;
 	description: string;
 	image?: ImageMetadata;
+	type?: 'website' | 'article';
 }
 
 const canonicalURL = new URL(Astro.url.pathname, Astro.site);
 
-const { title, description, image = FallbackImage } = Astro.props;
+const { title, description, image = FallbackImage, type = 'website' } = Astro.props;
+const socialImage = new URL(image.src, Astro.site);
+const websiteSchema = {
+	'@context': 'https://schema.org',
+	'@type': 'WebSite',
+	name: SITE_TITLE,
+	url: new URL(import.meta.env.BASE_URL, Astro.site).href,
+	description,
+};
 ---
 
 <!-- Global Metadata -->
@@ -31,6 +40,7 @@ const { title, description, image = FallbackImage } = Astro.props;
 	href={new URL(pathWithBase('rss.xml'), Astro.site)}
 />
 <meta name="generator" content={Astro.generator} />
+<script type="application/ld+json" set:html={JSON.stringify(websiteSchema)} />
 
 <Font cssVariable="--font-atkinson" preload />
 
@@ -42,11 +52,14 @@ const { title, description, image = FallbackImage } = Astro.props;
 <meta name="description" content={description} />
 
 <!-- Open Graph / Facebook -->
-<meta property="og:type" content="website" />
+<meta property="og:type" content={type} />
 <meta property="og:url" content={Astro.url} />
 <meta property="og:title" content={title} />
 <meta property="og:description" content={description} />
-<meta property="og:image" content={new URL(image.src, Astro.url)} />
+<meta property="og:image" content={socialImage} />
 
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content={title} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={socialImage} />
