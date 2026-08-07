@@ -1,4 +1,4 @@
-# kofsitho87.log
+# Dan.log
 
 Astro와 GitHub Pages로 만든 개인 기술 블로그입니다.
 
