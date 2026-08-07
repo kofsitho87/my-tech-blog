@@ -1,0 +1,459 @@
+---
+title: '예약 조회가 느릴 때 AI는 무엇을 말해야 할까?: LiveKit Async Tools로 dead air 줄이기'
+description: '병원 예약 API가 늦어질 때 무조건 기다리라는 말을 반복하지 않고, 진행 상태·filler speech·취소·중복 호출을 안전하게 설계하는 방법을 현재 예약 조회 구조와 함께 설명합니다.'
+pubDate: '2026-08-07'
+heroImage: '../../assets/blog/voice-ai-async-tools-reservation-lookup-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+환자가 병원에 전화해 묻습니다.
+
+> “제가 잡아 둔 예약이 언제였죠?”
+
+AI 상담원은 환자를 확인하고 병원 예약 시스템에 요청을 보냅니다. 그런데 응답이 바로 오지 않습니다. 전화기 너머로 1초, 2초, 3초 동안 아무 말도 들리지 않습니다.
+
+환자는 이 침묵을 서버 처리 시간으로 받아들이지 않습니다.
+
+- 내 말을 못 알아들었나?
+- 전화가 끊겼나?
+- 다시 말해야 하나?
+
+화면이 있는 서비스라면 spinner나 progress bar를 보여줄 수 있습니다. 전화에는 화면이 없습니다. **AI가 적절한 순간에 건네는 짧은 한마디가 곧 로딩 화면**입니다.
+
+그렇다고 “잠시만 기다려 주세요”를 계속 반복하는 것도 답은 아닙니다. 실제 조회가 시작되기 전에 진행 중이라고 말하거나, 아직 결과가 없는데 “확인됐습니다”라고 말하면 속도보다 더 중요한 신뢰를 잃습니다. 조회 중 환자가 다른 질문을 했을 때 Tool이 또 실행되거나, 취소한 조회가 뒤늦게 결과를 말하는 문제도 생길 수 있습니다.
+
+이 글에서는 와이즈에이아이 인바운드 에이전트의 실제 예약 조회 흐름을 기준으로 다음 질문에 답해 보겠습니다.
+
+> 예약 API가 느릴 때 AI는 무엇을, 언제, 어떤 근거로 말해야 하는가?
+
+> **Version note:** 이 글은 2026년 8월 7일과 프로젝트에 고정된 `livekit-agents==1.6.8`을 기준으로 작성했습니다. LiveKit Async Tools는 빠르게 변하는 기능이므로 적용 전 최신 문서를 다시 확인해야 합니다.
+
+## 목차
+
+- [1. 느린 API보다 먼저 고쳐야 할 것은 긴 침묵이다](#1-느린-api보다-먼저-고쳐야-할-것은-긴-침묵이다)
+- [2. 현재 예약 조회는 하나의 API 호출이 아니다](#2-현재-예약-조회는-하나의-api-호출이-아니다)
+- [3. 첫 응답시간과 업무 완료시간을 분리한다](#3-첫-응답시간과-업무-완료시간을-분리한다)
+- [4. AI가 말해야 하는 네 가지 순간](#4-ai가-말해야-하는-네-가지-순간)
+- [5. Progress update와 filler speech는 역할이 다르다](#5-progress-update와-filler-speech는-역할이-다르다)
+- [6. 현재 구조에 Async Tools를 적용한다면](#6-현재-구조에-async-tools를-적용한다면)
+- [7. 조회는 취소할 수 있어도 변경과 취소는 다르다](#7-조회는-취소할-수-있어도-변경과-취소는-다르다)
+- [8. 빈 결과와 실패를 같은 문장으로 말하지 않는다](#8-빈-결과와-실패를-같은-문장으로-말하지-않는다)
+- [9. 자연스러운 안내는 관측 가능한 이벤트에서 시작한다](#9-자연스러운-안내는-관측-가능한-이벤트에서-시작한다)
+- [10. 도입 전에 확인할 체크리스트](#10-도입-전에-확인할-체크리스트)
+- [마치며](#마치며)
+
+---
+
+## 1. 느린 API보다 먼저 고쳐야 할 것은 긴 침묵이다
+
+예약 시스템이 항상 즉시 응답하도록 만드는 것이 가장 좋습니다. 하지만 실제 서비스에서는 네트워크, EMR, 인증, 동시 요청량처럼 Voice AI가 통제할 수 없는 시간이 생깁니다.
+
+LiveKit Blog의 [Async Tools for Voice Agents](https://livekit.com/blog/async-tools-voice-agents)는 이 상황에서 문제를 두 부분으로 나눕니다.
+
+1. 백엔드 작업이 오래 걸린다.
+2. Tool이 끝날 때까지 대화까지 함께 멈춘다.
+
+첫 번째는 API 성능 문제입니다. 두 번째는 대화 설계 문제입니다.
+
+일반적인 function tool은 결과가 반환될 때까지 해당 turn을 점유합니다. 외부 요청이 짧으면 거의 느껴지지 않지만, 여러 단계를 거치거나 tail latency가 커지면 통화에는 그대로 dead air가 남습니다. API 시간을 당장 줄이지 못하더라도, 조회 시작과 진행 상태를 사실대로 알리면 환자는 연결이 유지되고 있음을 알 수 있습니다.
+
+중요한 점은 안내 문장이 성능을 개선하는 것은 아니라는 사실입니다.
+
+```text
+실제 업무 완료시간 = 그대로일 수 있음
+환자가 첫 반응을 듣는 시간 = 짧아질 수 있음
+환자가 이유 없이 듣는 침묵 = 줄어들 수 있음
+```
+
+따라서 목표는 “느려도 빠르게 느끼게 속이는 것”이 아닙니다. **처리 상태를 숨기지 않고, 기다림의 이유와 다음 상태를 정확하게 전달하는 것**입니다.
+
+---
+
+## 2. 현재 예약 조회는 하나의 API 호출이 아니다
+
+와이즈에이아이의 `get_my_appointment_list` Tool은 단순히 예약 API 하나를 호출하지 않습니다. 현재 흐름은 다음 단계로 구성됩니다.
+
+1. `BOOKING_INQUIRY: STARTED` 이벤트를 기록합니다.
+2. 환자의 생년월일이 없으면 `VerifyPatientIdentityTask`로 환자를 확인합니다.
+3. 필요한 경우 `GetBirthdateDtmfTask`로 키패드 입력을 받습니다.
+4. 전화번호, 생년월일, 차트 번호를 정규화합니다.
+5. EMR 예약 확정 내역 API를 호출합니다.
+6. 성공, 빈 목록, 본인확인 미완료, 상담원 연결, 오류를 구분합니다.
+7. 완료된 조회만 `BOOKING_INQUIRY: SUCCESS`로 기록합니다.
+
+<MermaidDiagram chart={`
+flowchart TD
+    U["환자: 예약을 확인해 주세요"] --> T["get_my_appointment_list Tool"]
+    T --> S["BOOKING_INQUIRY STARTED"]
+    S --> I{"환자 정보가 충분한가?"}
+
+    I -->|"아니요"| V["환자 조회·본인확인"]
+    V --> D["필요 시 생년월일 DTMF"]
+    D --> N["조회 조건 정규화"]
+    I -->|"예"| N
+
+    N --> API["EMR 예약 내역 조회"]
+    API --> R{"조회 결과"}
+    R -->|"예약 있음"| FOUND["예약 일시 안내"]
+    R -->|"정상 응답·0건"| EMPTY["예약 없음 안내"]
+    R -->|"본인확인 미완료"| INCOMPLETE["중단 또는 재시도"]
+    R -->|"조회 실패"| ERROR["오류 안내·대안 제시"]
+    R -->|"확인 불가"| HUMAN["상담원 연결"]
+`} />
+
+여기에는 두 종류의 작업이 섞여 있습니다.
+
+- **대화가 필요한 단계:** 생년월일 입력, 환자 확인, 재질문
+- **기다려야 하는 단계:** 외부 예약 시스템의 응답
+
+현재 구현은 이 전체 구간에서 `ctx.disallow_interruptions()`를 호출하고 순차적으로 완료합니다. 또한 `ctx.update()`와 `ctx.with_filler()`는 아직 사용하지 않습니다. 이 방식은 업무 흐름을 한 줄로 보호하기는 쉽지만, 외부 조회가 늦어질 때 환자에게 중간 상태를 전달하기 어렵습니다.
+
+반대로 Tool 첫 줄에 `ctx.update()`만 추가하는 것도 안전하지 않습니다. 첫 progress update 뒤에는 원래 Agent가 다시 말하고 들을 수 있는데, 같은 Tool 안에서는 환자 확인이나 DTMF처럼 대화 제어권이 필요한 작업이 계속될 수 있기 때문입니다. 일반 대화와 Task가 동시에 환자에게 말을 걸면 순서가 꼬일 수 있습니다.
+
+Async Tools를 적용하려면 먼저 **대화 단계와 백엔드 대기 단계를 분리**해야 합니다.
+
+---
+
+## 3. 첫 응답시간과 업무 완료시간을 분리한다
+
+“예약 조회가 몇 초 걸렸는가?”만 측정하면 환자가 실제로 경험한 대기를 설명하기 어렵습니다. 적어도 두 시간을 나눠야 합니다.
+
+| 구분 | 시작 | 끝 | 환자가 느끼는 것 |
+| --- | --- | --- | --- |
+| 첫 응답시간 | 조회 요청 발화 종료 | AI의 조회 시작 안내 | 내 요청을 들었는가 |
+| 업무 완료시간 | 조회 시작 | 예약 결과 확정 | 실제 업무가 끝났는가 |
+
+일반 Tool에서는 두 시간이 거의 붙어 있습니다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    actor P as 환자
+    participant A as AI 상담원
+    participant E as 병원 예약 시스템
+
+    P->>A: 제 예약이 언제인가요?
+    A->>E: 예약 내역 조회
+    Note over P,A: 결과가 올 때까지 dead air
+    E-->>A: 예약 결과
+    A-->>P: 8월 12일 오후 2시 예약입니다
+`} />
+
+Async Tool은 이 둘을 분리합니다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    actor P as 환자
+    participant A as AI 상담원
+    participant T as 예약 조회 Tool
+    participant E as 병원 예약 시스템
+
+    P->>A: 제 예약이 언제인가요?
+    A->>T: 예약 조회 시작
+    T-->>A: 조회를 시작했다는 progress update
+    A-->>P: 예약 정보를 확인해 볼게요
+    T->>E: 예약 내역 조회
+
+    opt 조용한 대기가 기준 시간을 넘김
+        T-->>P: 병원 예약 시스템에서 확인 중입니다
+    end
+
+    E-->>T: 예약 결과
+    T-->>A: 최종 결과
+    A-->>P: 8월 12일 오후 2시 예약입니다
+`} />
+
+첫 안내가 빨라졌다고 최종 결과까지 빨라진 것은 아닙니다. 대신 환자는 요청이 접수됐고, 무엇을 기다리고 있으며, 언제 결과가 확정됐는지 구분해서 듣게 됩니다.
+
+이 관점은 앞서 다룬 [STT·LLM·TTS 지연시간](/my-tech-blog/blog/voice-ai-stt-llm-tts-latency/)과도 다릅니다. 그 글이 환자 발화 뒤 첫 음성이 나올 때까지의 pipeline을 다뤘다면, 이번 문제는 **첫 음성이 나온 뒤에도 계속되는 Tool의 수명주기**를 다룹니다.
+
+---
+
+## 4. AI가 말해야 하는 네 가지 순간
+
+좋은 진행 안내는 문장보다 timing이 먼저입니다. 예약 조회에서는 네 순간을 구분할 수 있습니다.
+
+### 4.1 요청을 받아들였을 때
+
+실제로 조회를 시작할 준비가 됐을 때 한 번만 짧게 알립니다.
+
+> “예약 정보를 확인해 볼게요.”
+
+아직 본인확인 정보가 부족하다면 “조회 중”이라고 말하면 안 됩니다. 먼저 필요한 정보를 요청해야 합니다.
+
+> “예약 확인을 위해 생년월일 여섯 자리를 키패드로 입력해 주세요.”
+
+### 4.2 조용한 대기가 길어졌을 때
+
+빠르게 끝난 조회에는 filler가 필요하지 않습니다. 정해 둔 idle threshold를 넘겼을 때만 현재 대기 원인을 짧게 말합니다.
+
+> “병원 예약 시스템에서 확인 중입니다. 잠시만 기다려 주세요.”
+
+예를 들어 2~3초를 시작점으로 실험할 수 있지만, 이 값은 보편적인 정답이 아닙니다. 실제 API latency 분포, 첫 안내의 재생 길이, TTS 속도와 환자 반응을 함께 보고 정해야 합니다.
+
+### 4.3 의미 있는 단계가 바뀌었을 때
+
+진행 상황이 실제로 달라졌을 때만 update를 보냅니다.
+
+> “본인 확인을 마쳤고, 이제 예약 내역을 불러오고 있습니다.”
+
+아무 상태 변화가 없는데 “거의 다 됐습니다”라고 말하면 근거 없는 약속이 됩니다. 예상 완료시간을 알 수 없다면 시간도 단정하지 않는 편이 낫습니다.
+
+### 4.4 결과가 확정됐을 때
+
+완료 표현은 성공 응답을 받은 뒤에만 사용합니다.
+
+> “확인됐습니다. 8월 12일 오후 2시 예약이 있습니다.”
+
+결과가 0건이면 “조회가 실패했다”가 아니라 “정상적으로 조회했지만 예약이 없다”라고 말해야 합니다. 반대로 timeout이나 API 오류를 빈 결과처럼 안내해서도 안 됩니다.
+
+| 상태 | 적절한 안내 | 피해야 할 안내 |
+| --- | --- | --- |
+| 조회 시작 | “예약 정보를 확인해 볼게요.” | “예약이 확인됐습니다.” |
+| 대기 지속 | “병원 예약 시스템에서 확인 중입니다.” | “곧 끝납니다.” |
+| 정상 0건 | “확인된 예약이 없습니다.” | “조회에 실패했습니다.” |
+| API 실패 | “지금은 예약 정보를 불러오지 못했습니다.” | “예약이 없습니다.” |
+| 사용자 취소 | “예약 조회를 중단했습니다.” | 뒤늦은 결과 안내 |
+
+짧고 정확한 문장이 중요합니다. 환자는 시스템 내부 단계 이름이나 API 상태 코드를 들을 필요가 없습니다. 다만 “처리 중”, “완료”, “실패”의 경계는 분명하게 들려야 합니다.
+
+---
+
+## 5. Progress update와 filler speech는 역할이 다르다
+
+LiveKit Agents 1.6의 Async Tools에는 기다림을 설명하는 두 통로가 있습니다.
+
+### `ctx.update()`: Agent가 알아야 하는 상태
+
+첫 `ctx.update(message)` 호출은 Tool을 non-blocking으로 바꾸고, 그 message를 LLM에 전달해 Agent가 자연스럽게 말하도록 합니다. 이후 update도 chat context에 남고, Agent와 환자가 말하고 있지 않을 때 다음 응답으로 전달됩니다.
+
+다음과 같은 정보에 적합합니다.
+
+- 조회가 실제로 시작됨
+- 본인확인이 끝나고 예약 조회 단계로 이동함
+- 일부 결과를 찾았고 다음 검증을 진행함
+- 최종 결과를 해석하는 데 필요한 상태가 바뀜
+
+### `ctx.with_filler()`: LLM이 기억할 필요 없는 짧은 대기음성
+
+`ctx.with_filler()`는 지정한 시간 동안 session이 계속 idle일 때 `session.say()`로 짧은 음성을 재생합니다. LLM을 거치지 않으므로 단순한 대기 안내에 적합합니다.
+
+- “잠시만 기다려 주세요.”
+- “계속 확인하고 있습니다.”
+
+두 기능을 같은 것으로 취급하면 문제가 생깁니다. 모든 filler를 chat context에 넣으면 대화 기록이 불필요하게 길어지고, 모든 상태 변화를 고정 문장으로 재생하면 LLM은 현재 단계의 의미를 알지 못합니다.
+
+> **판단 기준:** 다음 답변을 만들 때 Agent가 알아야 할 사실은 `update`, 조용한 구간을 메우기만 하는 말은 `filler`로 보냅니다.
+
+Filler를 너무 자주 재생하면 환자가 끼어들 틈이 사라집니다. 고정 간격으로 무한 반복하지 말고, 첫 지연 안내와 제한된 후속 안내 정도로 끝내는 편이 안전합니다.
+
+---
+
+## 6. 현재 구조에 Async Tools를 적용한다면
+
+현재 예약 조회 Tool에 필요한 변화는 “문장 한 줄 추가”가 아니라 단계 경계의 재설계입니다.
+
+### 6.1 대화가 필요한 본인확인은 foreground에 둔다
+
+환자 조회 결과에 따라 생년월일 DTMF를 받아야 할 수 있습니다. 이 구간은 백그라운드 작업이 아니라 환자와 순서대로 대화해야 하는 foreground 작업입니다.
+
+LiveKit의 `ctx.foreground()`는 async tool 안에서 AgentTask나 직접 발화를 실행할 때 다른 deferred reply와 충돌하지 않도록 대화의 floor를 확보합니다.
+
+### 6.2 본인확인 뒤 읽기 전용 조회를 background로 전환한다
+
+필요한 조건이 모두 모인 뒤 EMR 예약 조회를 시작하는 시점에 첫 `ctx.update()`를 보냅니다. 그때부터 일반 Agent는 대화를 이어갈 수 있고, 조회 결과는 완료 후 deferred reply로 돌아옵니다.
+
+### 6.3 긴 idle에만 filler를 예약한다
+
+EMR 요청을 `ctx.with_filler()` 범위로 감싸면 빠른 응답에는 아무 말도 추가되지 않고, 설정한 idle 시간이 넘을 때만 대기 안내가 나갑니다.
+
+구조를 단순화한 **적용 설계 예시**는 다음과 같습니다. 현재 저장소에 그대로 구현된 코드는 아닙니다.
+
+```python
+@function_tool(flags=ToolFlag.CANCELLABLE, on_duplicate="reject")
+async def get_my_appointment_list(ctx: RunContext_T) -> str:
+    async with ctx.foreground():
+        lookup_key = await verify_and_collect_identity(ctx)
+
+    await ctx.update("본인 확인을 마쳤고 예약 내역을 조회하고 있습니다.")
+
+    async with ctx.with_filler(
+        "병원 예약 시스템에서 계속 확인 중입니다.",
+        delay=3,
+    ):
+        result = await fetch_reservations(lookup_key)
+
+    return present_reservation_result(result)
+```
+
+실제 적용 시에는 현재 `GetMyReservationsResult`의 `completed`, `identity_incomplete`, `escalated`, `error` 상태와 기존 이벤트 기록을 그대로 보존해야 합니다. `action_mode_handler`가 만드는 상담원 연결·메모 분기도 async 전환 뒤 같은 순서로 동작하는지 확인해야 합니다.
+
+또 하나의 선택지는 Tool을 아예 두 경계로 나누는 것입니다.
+
+```text
+환자 확인 Task (foreground)
+        ↓ typed identity result
+예약 조회 Tool (background read)
+        ↓ structured reservation result
+SingleAgent가 최종 안내
+```
+
+이 구조는 취소와 중복 호출 정책을 읽기 전용 조회에만 적용하기 쉽습니다. 반면 기존 Tool과 event 흐름을 더 크게 바꿔야 하므로 migration과 회귀 테스트 비용이 생깁니다.
+
+---
+
+## 7. 조회는 취소할 수 있어도 변경과 취소는 다르다
+
+Async Tool이 생기면 환자는 조회 중에도 말할 수 있습니다.
+
+> “됐어요. 그냥 상담원 연결해 주세요.”
+
+이때 interruption과 cancellation을 구분해야 합니다.
+
+- **Interruption:** 환자가 AI의 발화를 끊습니다.
+- **Cancellation:** 실행 중인 Tool 자체를 중단합니다.
+
+LiveKit에서는 Tool에 `ToolFlag.CANCELLABLE`을 지정하면 LLM이 실행 중인 task를 조회하고 `cancel_task`로 중단할 수 있습니다. Tool 내부에는 `asyncio.CancelledError`가 전달됩니다. 다만 모든 업무를 취소 가능하게 만들어서는 안 됩니다.
+
+| 업무 단계 | 취소 정책 | 이유 |
+| --- | --- | --- |
+| 예약 내역 읽기 | 대체로 취소 가능 | 중단해도 외부 상태가 바뀌지 않음 |
+| 예약 후보 탐색 | 대체로 취소 가능 | 다시 조회할 수 있음 |
+| 예약 생성 요청 | 상태 확인 후 결정 | 서버가 이미 접수했을 수 있음 |
+| 예약 변경·취소 확정 | 임의 취소 금지 | 요청 성공 여부가 불명확해질 수 있음 |
+
+현재 예약 조회 Tool은 시작과 함께 `ctx.disallow_interruptions()`를 호출합니다. 비동기 조회를 도입한다면 이 보호를 전체 Tool에 유지할지, 실제 상태 변경 구간으로 좁힐지 다시 결정해야 합니다. 공식 문서에 따르면 `disallow_interruptions()`가 적용된 cancellable Tool은 cancellation 요청도 거부합니다.
+
+중복 호출 정책도 필요합니다. 첫 조회가 실행 중인데 LLM이 같은 Tool을 다시 부르면 API 요청과 결과 안내가 두 번 생길 수 있습니다. LiveKit의 `on_duplicate`는 Tool 이름 기준으로 `allow`, `reject`, `replace`, `confirm`을 선택합니다.
+
+읽기 전용 예약 조회에는 보수적으로 `reject`를 시작점으로 삼을 수 있습니다. 새 요청으로 교체하려면 기존 호출을 안전하게 취소할 수 있는지 먼저 확인해야 합니다. 예약 생성·변경·취소처럼 외부 상태를 바꾸는 Tool은 idempotency key와 서버 측 처리 상태까지 함께 설계해야 합니다.
+
+---
+
+## 8. 빈 결과와 실패를 같은 문장으로 말하지 않는다
+
+대기 안내보다 중요한 것은 마지막 한 문장입니다.
+
+현재 `GetMyReservationsResult`는 다음 상태를 구분합니다.
+
+- `completed`: 예약 API가 정상 응답함. 예약 목록이 비어 있어도 이 상태에서만 정상 0건입니다.
+- `identity_incomplete`: 필요한 본인확인을 마치지 못함
+- `escalated`: 자동 확인이 어려워 상담원 연결이 필요함
+- `error`: 요청 구성, 정규화 또는 예약 API 호출 실패
+
+이 구분이 없으면 다음과 같은 위험한 안내가 만들어집니다.
+
+```text
+API timeout → []로 변환 → “예약이 없습니다”
+```
+
+환자는 실제 예약이 있는데도 없다고 믿을 수 있습니다. 그래서 Async Tool의 최종 return도 단순한 문장보다 구조화된 상태를 유지하는 편이 안전합니다.
+
+<MermaidDiagram chart={`
+stateDiagram-v2
+    [*] --> LookingUp
+    LookingUp --> CompletedWithItems: 정상 응답·1건 이상
+    LookingUp --> CompletedEmpty: 정상 응답·0건
+    LookingUp --> IdentityIncomplete: 입력 중단
+    LookingUp --> Escalated: 자동 확인 불가
+    LookingUp --> Error: timeout·HTTP·검증 오류
+    LookingUp --> Cancelled: 사용자 취소
+
+    CompletedWithItems --> [*]: 예약 일시 안내
+    CompletedEmpty --> [*]: 확인된 예약 없음
+    IdentityIncomplete --> [*]: 필요한 정보 안내
+    Escalated --> [*]: 상담원 연결
+    Error --> [*]: 실패 고지·대안 제시
+    Cancelled --> [*]: 중단 확인
+`} />
+
+진행 update에도 같은 원칙이 적용됩니다. LLM이 “완료”로 오해할 표현을 보내지 말고, update template에서 아직 진행 중인 상태임을 명확히 해야 합니다. 최종 완료 문장은 Tool의 return 뒤 한 번만 생성하도록 경계를 잡아야 합니다.
+
+---
+
+## 9. 자연스러운 안내는 관측 가능한 이벤트에서 시작한다
+
+진행 안내가 자연스러운지는 문장만 읽어서는 알기 어렵습니다. 실제 통화에서 다음 시간을 연결해 봐야 합니다.
+
+```text
+환자 발화 종료
+  → Tool 호출 시작
+  → 첫 progress update
+  → filler 재생
+  → 외부 API 응답
+  → 최종 결과 발화
+```
+
+현재 프로젝트는 예약 조회에서 이미 다음 근거를 남깁니다.
+
+- `BOOKING_INQUIRY: STARTED`
+- 환자 확인 성공·실패 이벤트
+- `GET_EMR_CONFIRMED_APPOINTMENTS` API 결과와 HTTP latency log
+- `BOOKING_INQUIRY: SUCCESS`와 예약 건수
+- `EXITED`, `ESCALATED`, `ERROR` 종료 상태
+
+Async Tool을 도입하면 여기에 다음 항목을 연결하는 것이 좋습니다.
+
+- 첫 update까지 걸린 시간
+- Tool 전체 실행시간과 외부 API 시간
+- filler가 실제 재생된 횟수
+- update 단계와 최종 상태
+- cancellation과 중복 호출 거부 횟수
+- 결과 발화 전에 환자가 이탈했는지 여부
+
+평균만 보면 안 됩니다. 대부분의 조회는 filler가 나오기 전에 끝나고 일부만 오래 걸릴 수 있습니다. p50과 함께 p90·p95 같은 tail latency를 보고, “긴 조회 중 무음 이탈”이 줄었는지 확인해야 합니다.
+
+그렇다고 근거 없이 성과를 먼저 적을 수는 없습니다. 이 글의 async 구조는 현재 구현을 바탕으로 한 적용 설계이며, 실제 효과는 실험과 통화 데이터로 검증해야 합니다.
+
+---
+
+## 10. 도입 전에 확인할 체크리스트
+
+### 대화 문장
+
+- 조회가 실제로 시작된 뒤에만 “확인 중”이라고 말하는가?
+- 완료 전 update가 완료처럼 들리지 않는가?
+- 정상 0건과 API 실패 문장이 분리돼 있는가?
+- filler가 환자의 말을 막을 정도로 자주 반복되지 않는가?
+- 환자 식별 정보나 예약 세부 정보가 불필요하게 반복되지 않는가?
+
+### 실행 제어
+
+- 대화형 본인확인과 background 조회의 경계가 분리돼 있는가?
+- AgentTask를 async Tool 안에서 실행할 때 `foreground()`가 필요한지 확인했는가?
+- 읽기와 쓰기 단계별로 cancellation 가능 여부를 정했는가?
+- 중복 호출의 `on_duplicate` 정책을 정했는가?
+- Agent handoff 뒤에도 작업을 유지해야 한다면 `AsyncToolset` 수명주기를 검토했는가?
+
+### 오류와 운영
+
+- 외부 API에 명시적인 timeout이 있는가?
+- timeout 뒤 재시도할지, 상담원 연결이나 메모로 전환할지 정했는가?
+- API는 실패했는데 “예약 없음”으로 안내되는 경로가 없는가?
+- STARTED부터 최종 상태까지 하나의 시도로 추적할 수 있는가?
+- 느린 통화와 환자 이탈을 함께 분석할 수 있는가?
+
+현재 EMR 예약 확정 조회에는 3초의 HTTP timeout이 설정되어 있습니다. 다만 전체 Tool에는 환자 확인과 DTMF 같은 선행 단계도 포함됩니다. 한 요청의 timeout만 보고 통화 전체의 최대 대기시간을 판단해서는 안 됩니다.
+
+---
+
+## 마치며
+
+예약 조회가 느릴 때 AI가 해야 할 말은 화려하지 않습니다.
+
+1. 실제로 시작했을 때 “확인해 보겠다”고 알립니다.
+2. 조용한 대기가 기준을 넘을 때만 현재 상태를 짧게 설명합니다.
+3. 의미 있는 단계가 바뀌었을 때 progress를 갱신합니다.
+4. 결과가 확정된 뒤에만 완료, 0건, 실패를 구분해 말합니다.
+
+LiveKit의 `ctx.update()`와 `ctx.with_filler()`는 이 문장을 재생하는 기능이지만, 핵심은 API가 아닙니다. 본인확인처럼 환자와 대화해야 하는 단계, 취소 가능한 읽기, 중단하면 안 되는 쓰기, 결과가 확정된 순간을 먼저 분리해야 합니다.
+
+> **가장 좋은 대기 안내는 기다림을 감추는 말이 아니라, 시스템이 실제로 알고 있는 상태를 정확한 순간에 전달하는 말입니다.**
+
+### 참고 자료
+
+- [LiveKit Blog — Async Tools for Voice Agents: Keep Talking While Work Runs](https://livekit.com/blog/async-tools-voice-agents)
+- [LiveKit Docs — Async tools](https://docs.livekit.io/agents/logic/tools/async/)
+- [LiveKit Blog — Understand and Improve Voice Agent Latency](https://livekit.com/blog/understand-and-improve-agent-latency)
+- [LiveKit Blog — Diagnosing Blocked Event Loops in LiveKit Agents](https://livekit.com/blog/diagnosing-blocked-event-loops)
+
