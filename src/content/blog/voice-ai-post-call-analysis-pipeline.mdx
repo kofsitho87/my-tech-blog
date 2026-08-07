@@ -1,0 +1,557 @@
+---
+title: '통화 종료가 데이터의 시작이다: 병원 Voice AI의 후처리 분석 파이프라인'
+description: 'LiveKit Agent의 대화 기록과 이벤트가 Kafka를 거쳐 분류·전사 보정·요약·성과 분석 데이터로 바뀌고 서비스 개선으로 이어지는 과정을 소개합니다.'
+pubDate: '2026-08-07'
+heroImage: '../../assets/blog/voice-ai-post-call-analysis-pipeline-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+## 1. 환자가 전화를 끊은 뒤에도 남은 질문들
+
+한 환자가 병원에 전화해 기존 예약을 변경하려고 한다.
+
+AI 상담원은 환자의 예약을 찾고 다른 날짜를 확인한다. 원하는 시간에 가능한 일정이 없어 사람 상담원에게 연결한다. 상담원은 환자와 직접 대화한 뒤 다음 날 다시 연락하기로 한다. 환자가 전화를 끊으면서 통화는 끝난다.
+
+실시간 Voice AI의 일은 여기까지다. 하지만 병원 운영과 서비스 개선을 위해서는 아직 답해야 할 질문이 남아 있다.
+
+- 환자는 처음에 무엇을 요청했는가?
+- 예약 변경은 실제로 완료됐는가?
+- AI가 처리하지 못해 상담원에게 연결한 것인가?
+- 상담원 연결은 성공했는가?
+- 연결 이후 환자의 문제가 해결됐는가?
+- 가능한 일정이 없었던 것과 AI가 일정을 찾지 못한 것을 어떻게 구분할까?
+- 다음 날 후속 연락이 필요하다는 사실을 누가 확인할까?
+
+통화 녹음과 transcript를 저장하는 것만으로는 이 질문에 바로 답하기 어렵다. 운영자가 매번 전체 통화를 듣거나 긴 대화를 읽어야 한다면, 통화량이 늘어날수록 분석 비용도 같은 속도로 증가한다.
+
+우리는 한 건의 통화를 **대화 기록**에서 **구조화된 운영 데이터**로 바꾸는 별도의 후처리 pipeline을 운영한다.
+
+> **실시간 통화가 환자의 문제를 해결하는 과정이라면, 통화 후 분석은 다음 통화를 더 잘 해결하기 위한 과정이다.**
+
+---
+
+## 2. 실시간 Agent와 후처리 Consumer를 분리한다
+
+통화 중 가장 중요한 것은 환자와의 대화다.
+
+- 음성을 빠르게 인식해야 한다.
+- 적절한 순간에 답해야 한다.
+- 예약 API와 상담원 연결을 안정적으로 실행해야 한다.
+- 환자가 전화를 끊으면 자원을 안전하게 정리해야 한다.
+
+반면 통화 분류, 녹음 보정 전사, 요약과 통계 분석은 즉시 끝날 필요가 없다. 오히려 통화가 완전히 종료된 뒤 전체 맥락을 확보해야 더 정확하다.
+
+이 작업을 실시간 Agent 안에 모두 넣으면 분석 LLM이나 database 장애가 실제 전화 상담까지 영향을 줄 수 있다. 녹음 파일이 아직 업로드되지 않았는데 전사를 시작하거나, 분석이 끝날 때까지 Agent worker가 불필요하게 남는 문제도 생긴다.
+
+그래서 두 서비스의 책임을 나눈다.
+
+| LiveKit Inbound Agent | Conversation Analysis Consumer |
+|---|---|
+| 환자의 현재 발화를 듣고 응답 | 종료된 통화 전체를 해석 |
+| 예약·FAQ·상담원 연결 실행 | 결과 분류·전사 보정·요약 |
+| 짧은 응답시간과 통화 안정성이 중요 | 정확성·재처리 가능성·추적성이 중요 |
+| 한 통화의 실시간 상태를 관리 | 여러 통화의 결과와 품질을 집계 |
+| 장애가 환자 경험에 즉시 영향 | 개별 분석 실패를 나중에 복구 가능 |
+
+두 서비스 사이를 연결하는 것이 Kafka다.
+
+<MermaidDiagram chart={`flowchart LR
+    subgraph REALTIME["실시간 통화 경로"]
+        CALL["환자 전화"] --> AGENT["LiveKit Inbound Agent"]
+        AGENT --> TASKS["예약 · 안내 · 상담원 연결"]
+    end
+
+    TASKS -->|"통화 종료"| KAFKA["Kafka<br/>aiu.inbound-call.analysis"]
+
+    subgraph POSTCALL["통화 후 분석 경로"]
+        KAFKA --> CONSUMER["Conversation Analysis Consumer"]
+        CONSUMER --> CLASSIFY["분류 · 전사 보정 · 요약"]
+        CLASSIFY --> ANALYTICS["Analytics · Semantics"]
+        ANALYTICS --> STORE["DB · 후속 Kafka"]
+    end`} />
+
+이 구조에서는 분석 로직을 변경하거나 Consumer를 다시 배포해도 실시간 통화 경로를 직접 건드리지 않는다. 반대로 분석이 잠시 느려져도 Agent는 다음 환자의 전화를 받을 수 있다.
+
+---
+
+## 3. 통화가 끝날 때 무엇을 Kafka에 보낼까
+
+통화가 종료되면 Agent의 shutdown callback이 실행된다. 이 callback은 종료 시각을 기록하고 녹음을 중지한 뒤, 분석에 필요한 payload를 `aiu.inbound-call.analysis` topic에 발행한다.
+
+분석 시스템에는 통화 식별 정보와 병원별 설정, 환자와 AI가 나눈 대화, 예약·안내·상담원 연결 과정에서 발생한 업무 event, 녹음 파일 위치와 처리 결과를 하나의 메시지로 묶어 전달한다. 분석에 필요하지 않거나 외부로 전달하면 안 되는 runtime 정보는 제외한다.
+
+전달하는 내용은 크게 세 종류로 나뉜다.
+
+### 통화와 병원 정보
+
+- 통화별 Room 이름
+- 환자 전화번호와 식별 정보
+- 병원과 client 정보
+- 통화 시작·종료 시각
+- 병원별 flow configuration
+- 예약과 상담원 연결 결과
+- 녹음 파일 위치와 녹음 시작 시각
+
+### 대화 기록
+
+- 환자, AI와 developer message
+- 각 발화의 시작·종료 timestamp
+- interruption 여부
+- transcript confidence
+- STT·LLM·TTS와 E2E metric
+
+### Agent 실행 event
+
+- 대화 item 추가
+- Function Tool 실행
+- 예약, 정보 조회와 상담원 연결의 상태 변화
+- 통화 종료 actor와 reason code
+
+이렇게 분석에 필요한 정보만 선별하면 후처리 Consumer가 실시간 Agent의 내부 상태에 의존하지 않고도 통화의 흐름과 업무 결과를 재구성할 수 있다.
+
+---
+
+## 4. Kafka는 단순한 전달 통로가 아니다
+
+Agent가 분석 함수를 직접 호출하는 대신 Kafka에 메시지를 남기면 실시간 경로와 후처리 경로의 속도를 분리할 수 있다.
+
+<MermaidDiagram chart={`sequenceDiagram
+    actor Patient as 환자
+    participant Agent as Inbound Agent
+    participant Kafka as Kafka
+    participant Consumer as Analysis Consumer
+    participant DB as Database
+
+    Patient->>Agent: 통화 종료
+    Agent->>Agent: 종료 시각 기록 · 녹음 중지
+    Agent->>Kafka: 통화 payload 발행
+    Agent-->>Agent: 통화 자원 정리
+    Kafka-->>Consumer: 메시지 전달
+    Consumer->>Consumer: 분류 · 요약 · 분석
+    Consumer->>DB: 결과 저장`} />
+
+이 분리는 다음과 같은 운영상의 장점을 만든다.
+
+- Agent는 분석 완료를 기다리지 않고 종료할 수 있다.
+- 통화량과 분석량을 독립적으로 확장할 수 있다.
+- Consumer가 잠시 중단돼도 backlog를 나중에 처리할 수 있다.
+- 같은 통화 event를 다른 후속 시스템으로 다시 발행할 수 있다.
+- 과거에 저장한 원본을 새로운 분석 규칙으로 재처리할 수 있다.
+
+다만 message broker가 중복 처리를 자동으로 없애 주는 것은 아니다. Consumer가 DB에 저장한 직후 offset 반영 전에 중단되면 같은 메시지를 다시 받을 수 있다.
+
+우리 Consumer는 가장 먼저 `room_name`으로 기존 결과가 있는지 확인한다. 이미 처리한 Room이면 분석을 건너뛴다. 이 idempotency 검사가 없으면 같은 통화가 여러 행으로 저장되고 통계가 부풀려질 수 있다.
+
+---
+
+## 5. Transcript는 말한 내용을, Event는 일어난 일을 알려준다
+
+통화 분석에는 서로 다른 두 종류의 증거가 있다.
+
+### 대화 Transcript
+
+Transcript는 환자와 AI가 어떤 말을 주고받았는지 알려준다.
+
+> **환자:** 다음 주 금요일로 예약을 변경하고 싶어요.
+>
+> **AI:** 가능한 시간을 확인해 보겠습니다.
+
+여기에는 환자의 의도와 감정, AI 답변의 적절성 같은 의미가 담겨 있다. 하지만 이 문장만으로 예약 API가 실제로 실행됐는지는 알 수 없다.
+
+### 구조화된 Agent Event
+
+Agent는 업무의 시작과 결과를 developer message의 구조화된 event로 남긴다.
+
+```text
+[BOOKING_MODIFY: STATUS=STARTED]
+[SCHEDULE_SELECTION: STATUS=NO_RESULT]
+[WARM_TRANSFER_CALL: STATUS=STARTED]
+[WARM_TRANSFER_CALL: STATUS=SUCCESS]
+```
+
+Event는 시스템이 무엇을 시도했고 어떤 상태로 끝났는지를 알려준다. 환자와 AI가 “변경되었습니다”라고 말했더라도 실제 성공 event가 없다면 업무 완료로 확정해서는 안 된다.
+
+| 질문 | Transcript | Agent Event |
+|---|:---:|:---:|
+| 환자가 무엇을 원했는가 | 강함 | 일부만 알 수 있음 |
+| 환자가 불만을 표현했는가 | 강함 | 직접 알기 어려움 |
+| 예약 API가 성공했는가 | 추정만 가능 | 강함 |
+| 어느 단계에서 실패했는가 | 추정 필요 | 강함 |
+| 상담원 연결이 시작·성공했는가 | 일부 확인 | 강함 |
+| 답변이 환자 질문과 맞았는가 | 강함 | 직접 알기 어려움 |
+
+좋은 분석은 둘 중 하나를 선택하지 않는다. 확정 가능한 업무 결과는 event로 판단하고, event가 표현하지 못하는 의미는 transcript로 보완한다.
+
+---
+
+## 6. 첫 번째 분석: 기존 운영 지표를 위한 Event 분류
+
+Consumer가 중복 여부를 확인한 다음 수행하는 첫 작업은 기존 Conversation Classifier다.
+
+이 분류기는 LLM이 아니라 정해진 규칙으로 developer event를 읽어 boolean metadata를 만든다.
+
+- 예약 조회·생성·변경·취소 완료
+- 예약 업무 미완료
+- 병원 정보 안내 성공
+- 상담원 연결 성공
+- 연결 대기 timeout
+- 상담원 대기 중 환자 이탈
+- 운영시간 내·외 메모 접수
+- 인사말 전·중·후 조기 종료
+- 사용자의 명시적인 종료 요청
+
+예를 들어 `BOOKING_CREATE: STATUS=SUCCESS` event가 있으면 예약 생성 완료 flag가 켜지고, Warm Transfer가 시작됐지만 성공이나 명시적인 실패가 없다면 연결 대기 중 이탈 가능성을 표시한다.
+
+이 결과는 기존 dashboard와 하위 시스템의 호환성을 유지하는 데 중요하다. 그러나 통화 한 건을 여러 boolean으로 표현하면 한 통화에서 조회, 변경, 전환을 차례로 시도했을 때 각 결과의 관계와 시간 순서를 충분히 설명하기 어렵다.
+
+그래서 기존 분류를 유지하면서 더 정교한 Analytics v2를 별도 계층으로 추가했다.
+
+---
+
+## 7. 상담원 연결 이후에는 녹음으로 Transcript를 보완한다
+
+AI와 환자가 대화하는 동안에는 AgentSession이 transcript를 계속 기록한다. 그러나 Warm Transfer가 완료돼 사람 상담원과 환자가 직접 대화하기 시작하면, 그 이후의 발화가 기존 AI transcript에 완전하게 남지 않을 수 있다.
+
+통화 녹음에는 이 구간도 포함된다. Consumer는 다음 순서로 상담원 연결 이후 대화를 보완한다.
+
+1. 녹음 파일 경로를 확인한다.
+2. 파일이 object storage에 실제로 준비될 때까지 제한된 횟수로 기다린다.
+3. 상담원 연결 성공 event의 시점을 찾는다.
+4. 성공 이후 오디오 구간을 잘라낸다.
+5. 잘라낸 오디오를 별도로 전사한다.
+6. 상담원과 환자의 보정 transcript를 성공 event 바로 뒤에 삽입한다.
+
+<MermaidDiagram chart={`timeline
+    title 한 건의 통화와 녹음 시간축
+    녹음 시작 : AI 인사말
+    AI 상담 : 환자 예약 변경 요청
+    업무 처리 : 가능한 일정 조회
+    Warm Transfer 성공 : 상담원과 연결
+    보정 전사 구간 : 상담원 ↔ 환자 대화
+    통화 종료 : 녹음 파일 완료`} />
+
+이때 가장 중요한 것이 녹음의 시간 원점이다.
+
+`recording_started_at`은 녹음 파일의 0초가 실제로 언제였는지를 나타낸다. 발화 timestamp와 녹음 기준 시각이 다르면 상담원 연결 이후가 아닌 엉뚱한 구간을 자를 수 있다. 같은 기준은 message별 `playbackSegment`를 계산할 때도 사용한다.
+
+결과적으로 저장된 각 message는 transcript뿐 아니라 원본 녹음의 어느 구간에 해당하는지도 가질 수 있다.
+
+```json
+{
+  "role": "user",
+  "content": "다음 날 연락 부탁드립니다.",
+  "metrics": {
+    "started_speaking_at": 1770882551.94,
+    "stopped_speaking_at": 1770882554.44
+  },
+  "playbackSegment": {
+    "startRel": 71.94,
+    "endRel": 74.44
+  }
+}
+```
+
+운영자는 특정 message를 보다가 해당 오디오 구간으로 바로 이동할 수 있고, 분석 결과의 근거를 실제 음성으로 검증할 수 있다.
+
+---
+
+## 8. 긴 대화를 사람이 빠르게 읽을 수 있도록 요약한다
+
+보정 transcript와 재생 구간을 합친 뒤에는 LLM을 이용해 통화를 구조화된 형태로 요약한다.
+
+```json
+{
+  "title": "예약 변경 후속 연락 요청",
+  "content": "환자가 기존 예약을 금요일 오후로 변경하려 했으나 가능한 일정이 없어 상담원과 연결됐고, 다음 날 후속 연락을 요청했습니다."
+}
+```
+
+요약은 원본 transcript를 대체하지 않는다. 다음 목적을 가진 빠른 색인에 가깝다.
+
+- 운영자가 통화 목록에서 우선 확인할 대상을 찾는다.
+- 상담원이 후속 연락 전에 문의 맥락을 파악한다.
+- 긴 통화의 핵심 업무와 결과를 한눈에 본다.
+- dashboard와 CRM에서 사람이 읽을 설명을 제공한다.
+
+요약 모델 호출이 실패해도 원본 대화와 분류 결과는 저장할 수 있다. 요약은 유용하지만 통화 데이터의 진실의 원천은 아니다.
+
+---
+
+## 9. 분석 결과를 저장하고 다시 다음 시스템으로 보낸다
+
+Consumer는 기존 분류 결과, 보정된 conversation, 요약과 통화 정보를 새로운 payload로 만들어 후속 Kafka topic에 발행한다.
+
+- 기본 통화는 `aiu.inbound.call-end`
+- 별도 지역 처리가 필요한 통화는 전용 call-end topic
+
+후속 시스템은 이 event를 이용해 CRM, dashboard나 다른 운영 workflow를 이어갈 수 있다.
+
+동시에 기본 결과는 `inbound_conversation_results`에 저장된다.
+
+```text
+room_name
+recipient_data
+analysis_result
+conversation
+agent_events
+summary
+audio_url_path
+call_start_time / call_end_time
+reservation_info
+transfer_record
+business_data
+```
+
+이 원본 행이 있어야 분석 규칙이 바뀌었을 때 과거 통화를 다시 계산할 수 있다. 분석 결과만 저장하고 원시 대화와 event를 버리면 새로운 질문이 생길 때 답할 방법이 없다.
+
+---
+
+## 10. Boolean을 넘어 통화의 여정을 복원한다
+
+한 통화 안에서 환자는 여러 업무를 시도할 수 있다.
+
+```text
+예약 조회 성공
+    ↓
+예약 변경 시도
+    ↓
+가능한 일정 없음
+    ↓
+상담원 연결 성공
+    ↓
+후속 연락 약속
+```
+
+이 통화를 boolean으로만 표현하면 조회 성공, 변경 미완료와 상담원 연결 성공이 모두 `true`다. 사실은 틀리지 않지만 “이 통화가 최종적으로 어떻게 끝났는가”라는 질문에는 바로 답하지 못한다.
+
+Analytics v2는 원본에서 KPI까지 네 단계로 데이터를 접는다.
+
+<MermaidDiagram chart={`flowchart TB
+    L0["L0 Raw<br/>Conversation · Developer Events"]
+    L1["L1 Canonical Events<br/>시간순 정규화"]
+    L2["L2 Intent Attempts<br/>업무별 시도와 단계"]
+    L3["L3 Call Resolution<br/>통화당 하나의 최종 결과"]
+    L4["L4 KPI<br/>완료율 · 이탈 퍼널 · 책임별 손실"]
+
+    L0 --> L1 --> L2 --> L3 --> L4`} />
+
+### L1: Event를 시간순으로 정규화한다
+
+Developer message에서 event 이름, status, stage, actor, reason code와 timestamp를 읽어 `CallEvent` 목록으로 만든다. 여러 형식으로 남아 있던 과거 tag도 같은 구조로 변환하되 원본 detail은 보존한다.
+
+### L2: Event를 업무 시도로 묶는다
+
+예약 조회 한 번, 예약 변경 한 번과 상담원 연결 한 번을 각각 `IntentAttempt`로 만든다. 한 통화에 같은 업무를 두 번 시도했다면 순서가 다른 두 attempt가 된다.
+
+각 attempt에는 다음 정보가 들어간다.
+
+- 업무 intent
+- 통화 안에서 몇 번째 시도인지
+- 가장 멀리 도달한 stage
+- 최종 stage와 outcome
+- 반환된 결과 개수
+- 실패가 발생한 위치와 이유
+- 경계가 명시적 event인지 추정인지
+
+### L3: 통화 전체를 하나의 결과로 정리한다
+
+여러 attempt를 우선순위 규칙에 따라 통화당 하나의 `resolution`으로 접는다.
+
+| Resolution | 의미 |
+|---|---|
+| `SELF_SERVED` | AI가 사람 개입 없이 업무를 완료 |
+| `HUMAN_SERVED` | 사람 상담원에게 통화가 연결됨 |
+| `DEFERRED` | 메모나 후속 상담으로 이어짐 |
+| `ESCALATION_FAILED` | 상담원 연결을 시도했지만 실패 |
+| `UNRESOLVED` | 시스템이 업무를 처리하려 했지만 완료하지 못함 |
+| `ABANDONED` | 업무 시도 중 환자가 이탈 |
+| `NO_ENGAGEMENT` | 실제 업무 시도 전에 통화 종료 |
+
+### L4: 비교 가능한 KPI를 만든다
+
+통화당 resolution이 하나이므로 containment rate와 인텐트별 완료율의 분모가 명확해진다. Attempt별 stage를 보면 예약 과정의 어느 단계에서 가장 많이 이탈했는지도 계산할 수 있다.
+
+---
+
+## 11. 실패를 세려면 먼저 누구의 문제인지 구분해야 한다
+
+“예약 변경 미완료 100건”만으로는 무엇을 고쳐야 할지 알 수 없다.
+
+- 병원에 가능한 일정 데이터가 없었던 것인가?
+- 예약 API가 timeout된 것인가?
+- 환자가 날짜 선택 중 전화를 끊은 것인가?
+- AI가 환자의 대답을 인식하지 못한 것인가?
+- 병원 정책상 AI가 처리할 수 없어 사람에게 넘긴 것인가?
+
+Analytics v2는 실패를 세 축으로 표현한다.
+
+```text
+Failure = Where × What × Who
+
+Where : 어느 단계에서
+What  : 어떤 방식으로 실패했고
+Who   : 누가 개선해야 하는가
+```
+
+| 사례 | Stage | Mode | Owner |
+|---|---|---|---|
+| 예약 API timeout | 예약 확정 | 기술적 실패 | Backend |
+| 가능한 일정 0건 | 일정 선택 | 데이터 부족 | EMR Data |
+| AI가 답을 반복해서 요청 | 정보 확인 | 이해 실패 | AI Agent |
+| 상담원이 전화를 받지 않음 | 상담원 연결 | 연결 실패 | Human Staff |
+| 환자가 날짜 선택 중 종료 | 일정 선택 | 중도 이탈 | Patient |
+| 병원별 기능이 비활성화됨 | 업무 진입 | 정책 제한 | Policy Config |
+
+여기에 transcript confidence, 반복 질문, 침묵과 interruption 같은 `QualitySignals`를 함께 계산한다. 실패 owner를 정할 때 “AI 문제처럼 보인다”는 인상 대신 실제 대화 품질 신호를 근거로 사용할 수 있다.
+
+이 구조의 목적은 책임을 묻는 데 있지 않다. 개선 작업을 올바른 팀으로 보내기 위해서다. Backend 문제에는 retry와 API 개선이 필요하고, EMR Data 문제에는 병원 데이터 정비가 필요하며, 상담 인력 문제에는 운영시간과 배치 조정이 필요하다.
+
+---
+
+## 12. Event가 보지 못하는 영역은 Semantic 계층이 보완한다
+
+결정론 분석에도 구조적인 사각지대가 있다.
+
+> **Event는 시스템이 인지한 것만 기록한다. 시스템이 이해하지 못한 요청은 event를 남기지 않는다.**
+
+환자가 “그 내용을 문자로 보내주세요”라고 했는데 서비스가 SMS를 지원하지 않는다고 해보자. 시스템이 별도 업무로 인식하지 못하면 관련 event가 하나도 생기지 않는다. 결정론 분석만 보면 환자가 대화를 포기한 것으로 분류될 수 있지만, 실제로는 제품 기능의 공백이다.
+
+LLM 기반 Semantic 계층은 transcript에서 event가 표현하지 못한 의미를 찾는다.
+
+- 증상·치료 후 문제·의학적 조언 요청
+- billing, 보험, 증명서와 의무기록 문의
+- 불만, 좌절, 반복 질문과 칭찬
+- callback, 문자 전송과 미지원 거래 요청
+- 불명확한 transcript와 언어 불일치
+- 단일·복합 intent와 통화 중 intent 변경
+- 상담원 연결 후 실제 문제 해결 여부
+- 사후 QA를 위한 긴급 신호
+
+모든 finding에는 `confidence`와 근거가 된 `evidence_turn_indices`를 함께 저장한다. 입력에 존재하지 않는 turn을 근거로 제시하면 결과에서 제거한다.
+
+<MermaidDiagram chart={`flowchart LR
+    TRANSCRIPT["정규화된 Transcript"] --> LLM["Semantic Classifier"]
+    LLM --> FINDING["Finding<br/>code + confidence + evidence"]
+    SCOPE["Transcript Scope<br/>판단 가능한 범위"] --> FINDING
+    FINDING --> REVIEW["교차검증 · 개선 후보"]
+
+    EVENTS["Deterministic Analytics"] --> REVIEW
+    REVIEW -. "자동 귀인 변경 금지" .-> EVENTS`} />
+
+Semantic 결과는 결정론적 `failure_owner`를 자동으로 바꾸지 않는다. 대신 “Patient 이탈로 분류됐지만 transcript에는 frustration이 있는 통화”처럼 사람이 다시 검토할 후보를 찾는다.
+
+또한 다음 경계를 명확히 둔다.
+
+- 통화 종료 후 산출되므로 실시간 응급 라우팅에 사용하지 않는다.
+- 상담원 transcript가 없으면 상담 결과를 `unknown`으로 둔다.
+- model, prompt hash, temperature와 confidence 기준을 version에 포함한다.
+- 민감한 건강정보가 포함될 수 있어 별도 테이블과 접근 정책을 사용한다.
+- Semantic 결과는 하위 Kafka payload로 퍼뜨리지 않고 DB 안에만 저장한다.
+
+결정론 규칙은 과거 통화 전체를 비교적 저렴하게 다시 계산할 수 있지만 Semantic은 통화마다 LLM 비용이 발생한다. 신규 통화는 현재 전수 분석하고, 과거 통화 백필은 기간과 병원을 좁히거나 층화 sampling으로 비용을 통제한다.
+
+---
+
+## 13. 원본과 분석 결과를 왜 다른 테이블에 저장할까
+
+한 테이블에 원본 transcript, 모든 KPI와 Semantic finding을 계속 추가하면 단순해 보인다. 하지만 데이터의 성질과 사용 방식이 다르다.
+
+```text
+inbound_conversation_results
+│  원본 conversation · events · summary · 통화 정보
+│
+├── inbound_call_analytics       1:1
+│     결정론적 통화 resolution · failure · quality
+│
+├── inbound_call_attempts        1:N
+│     통화 안의 개별 업무 시도 · stage · outcome
+│
+└── inbound_call_semantics       1:1
+      LLM finding · evidence · transcript scope · limitations
+```
+
+분리하면 다음 장점이 생긴다.
+
+- KPI 조회 때마다 큰 conversation JSON을 읽지 않아도 된다.
+- 한 통화의 여러 attempt를 별도 행으로 집계할 수 있다.
+- 분석 규칙을 변경해 새 version을 계산해도 원본을 수정하지 않는다.
+- 결정론 결과와 비용이 드는 Semantic 결과의 재계산 정책을 나눌 수 있다.
+- 민감정보가 포함된 Semantic table에 별도 접근·보존 정책을 적용할 수 있다.
+- 기존 dashboard가 사용하는 원본 schema를 깨지 않고 새 분석을 추가할 수 있다.
+
+각 위성 테이블에는 `analytics_version` 또는 `semantic_version`을 남긴다. 같은 KPI라도 어떤 규칙과 model로 계산했는지를 알아야 배포 전후 결과를 올바르게 비교할 수 있기 때문이다.
+
+---
+
+## 14. 후처리 Pipeline의 핵심은 실패 격리와 재처리다
+
+이 pipeline에는 실패할 수 있는 지점이 많다.
+
+- 녹음 파일 업로드가 늦거나 누락됨
+- 상담원 구간 전사 실패
+- 요약 LLM 또는 fallback model 실패
+- 후속 Kafka 발행 실패
+- 기본 DB 저장 실패
+- Analytics v2 계산 또는 저장 실패
+- Semantic LLM이나 저장 실패
+
+모든 단계를 하나의 거대한 transaction처럼 취급하면 마지막 Semantic 분석 실패 때문에 앞에서 확보한 transcript와 기본 결과까지 잃을 수 있다.
+
+현재 흐름은 중요한 원본부터 저장하고 부가 계층의 실패를 분리한다.
+
+| 실패 지점 | 처리 방향 |
+|---|---|
+| 녹음 파일 없음 | 보정 전사를 건너뛰고 Agent transcript 사용 |
+| 보정 전사 실패 | 기존 conversation을 유지 |
+| 요약 실패 | summary 없이 분류·원본 저장 계속 |
+| Analytics v2 실패 | 기본 결과는 유지하고 backfill로 회수 |
+| Semantic 실패 | 결정론 결과를 유지하고 별도 batch로 재처리 |
+| 중복 Kafka message | `room_name` 확인 후 이미 저장된 통화 skip |
+
+Analytics v2가 사용하는 입력은 DB에 실제 저장되는 conversation과 같은 배열이어야 한다. 실시간 경로에서 role과 content만 남긴 축약본을 분석에 사용하면 `transcript_confidence`와 timestamp가 사라진다. 이후 DB 원본으로 backfill했을 때 같은 통화가 다른 결과를 내게 된다.
+
+**결정론 분석을 재처리하려면 같은 version과 같은 원본에서 같은 결과가 나와야 한다.** 그래서 입력 정규화도 분석 알고리즘만큼 중요한 계약이다. LLM을 사용하는 Semantic 계층은 완전한 결정성을 전제로 하지 않고, model·prompt·temperature와 confidence 기준을 version에 함께 기록해 결과를 비교할 수 있게 한다.
+
+---
+
+## 15. 통화 분석이 다시 제품 개선으로 돌아오는 방법
+
+후처리 분석의 목적은 예쁜 dashboard를 만드는 데서 끝나지 않는다. 분석 결과는 구체적인 개선 질문으로 바뀌어야 한다.
+
+- 예약 생성 attempt 중 가장 큰 이탈 stage는 어디인가?
+- 가능한 일정이 없어서 실패한 비율과 API 오류 비율은 각각 얼마인가?
+- 상담원 연결 실패가 queue timeout인지 상담원 거절인지 구분되는가?
+- 운영시간 외에는 어떤 문의가 가장 많이 들어오는가?
+- AI가 직접 완료한 통화와 사람에게 연결된 통화의 비율은 어떻게 변하는가?
+- 환자가 반복해서 질문하거나 AI를 수정한 통화는 무엇인가?
+- event가 잡지 못한 미지원 요청 중 가장 자주 등장하는 것은 무엇인가?
+- 새로운 prompt와 flow 배포 이후 같은 stage의 실패가 실제로 감소했는가?
+
+<MermaidDiagram chart={`flowchart LR
+    CALL["환자 통화"] --> RAW["대화 · Event · 녹음"]
+    RAW --> PIPELINE["분류 · 요약 · Analytics"]
+    PIPELINE --> INSIGHT["퍼널 · 실패 원인 · 미지원 요청"]
+    INSIGHT --> BACKLOG["Prompt · Flow · API · 병원 운영 개선"]
+    BACKLOG --> RELEASE["새로운 Agent Version"]
+    RELEASE --> CALL`} />
+
+예를 들어 예약 실패가 많다는 사실만 알면 “예약 Agent를 개선하자”는 넓은 결론밖에 내릴 수 없다. 하지만 실패가 본인확인 단계에 집중되고, reason code가 일치하지 않는 생년월일이며, STT confidence가 정상이라는 사실까지 알면 EMR matching 정책을 개선해야 한다는 구체적인 backlog가 된다.
+
+분석 결과에서 다시 원본 event, transcript와 오디오 구간으로 내려갈 수 있어야 숫자가 추측으로 끝나지 않는다. KPI에서 문제 구간을 찾고, 대표 통화를 열어 근거를 확인하며, 개선 후 같은 지표가 움직였는지 검증하는 순환이 필요하다.
+
+---
+
+## 16. 통화 기록과 통화 이해는 다르다
+
+Transcript는 환자와 AI가 무슨 말을 했는지 알려준다. Agent event는 시스템이 어떤 업무를 시도했고 실제로 성공했는지를 알려준다. 녹음은 transcript가 충분하지 않을 때 다시 확인할 근거를 제공한다.
+
+기존 분류는 운영 중 사용하던 결과와의 호환성을 지킨다. Analytics v2는 event의 시간 순서와 업무 시도를 복원해 통화당 하나의 결과와 실패 책임을 만든다. Semantic 계층은 event가 남지 않는 의미를 transcript에서 찾되, 결정론 결과와 분리해 비용과 민감정보를 관리한다.
+
+이 모든 작업을 실시간 Agent 밖에서 수행하기 때문에 환자와의 통화는 분석 model의 속도와 장애로부터 보호된다. 동시에 원본과 version을 남겨 새로운 규칙으로 과거 통화를 다시 계산할 수 있다.
+
+환자가 전화를 끊으면 대화는 끝난다. 그러나 그 통화가 무엇을 해결했고, 어디에서 막혔으며, 다음에는 무엇을 바꿔야 하는지를 알아내는 일은 그때부터 시작된다.
+
+**통화 종료는 Voice AI 업무의 끝이 아니라, 더 나은 다음 통화를 만드는 데이터의 시작이다.**
+
+---
