@@ -1,0 +1,459 @@
+---
+title: '전화가 연결되기 전에 Agent는 무엇을 기다려야 할까?: voxBridge와 LiveKit의 아웃바운드 호출 수명주기'
+description: '외부 오케스트레이터가 SIP 발신을 소유하는 구조에서 LiveKit Agent가 실제 통화 가능 시점을 어떻게 판단하고, Participant event race·timeout·실패·cleanup 경계를 어떻게 다뤄야 하는지 설명합니다.'
+lang: 'ko'
+pubDate: '2026-08-07'
+heroImage: '../../assets/blog/voice-ai-outbound-callee-lifecycle-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+아웃바운드 Voice AI의 Agent가 LiveKit job을 받았다.
+
+Room도 있고 Agent process도 시작됐다. 그렇다면 이제 인사말을 재생해도 될까?
+
+아직 아니다. 상대방 전화는 계속 울리고 있을 수 있다. SIP Participant는 Room에 들어왔지만 `sip.callStatus`가 아직 `active`가 아닐 수도 있다. 반대로 Agent가 event listener를 등록하기 전에 이미 상대방이 전화를 받았을 수도 있다.
+
+이 경계를 잘못 잡으면 사용자는 인사말의 끝부분만 듣거나, 전화를 받자마자 긴 침묵을 만난다. 더 나쁜 경우에는 아무도 받지 않은 통화를 정상 대화처럼 녹음하고 후처리 분석 메시지까지 만들 수 있다.
+
+웹 요청에서는 handler가 시작됐다는 사실과 요청이 도착했다는 사실이 거의 같은 의미다. 아웃바운드 전화에서는 다르다.
+
+> **Agent job이 시작됐다는 것, SIP Participant가 보인다는 것, 상대방과 오디오를 주고받을 수 있다는 것은 서로 다른 사건이다.**
+
+이 글에서는 SIP 발신을 별도 오케스트레이터가 소유하는 환경에서 LiveKit Agent가 무엇을 기다려야 하는지 설명한다. 현재 outbound-agent 저장소의 `wait_for_callee()`와 `entrypoint()`를 중심으로 event race, timeout 소유권, 실패 상태와 cleanup 경계를 살펴본다.
+
+> **Version note:** 이 글은 2026년 8월 7일의 outbound-agent 저장소와 `livekit-agents 1.6.8` lockfile을 기준으로 한다. LiveKit의 SIP 상태와 종료 사유는 버전에 따라 달라질 수 있으므로, 새 구현에서는 현재 공식 문서를 다시 확인해야 한다.
+
+## 목차
+
+- [1. 발신 주체와 대화 주체를 분리한다](#1-발신-주체와-대화-주체를-분리한다)
+- [2. 하나의 통화에는 여러 시작 시점이 있다](#2-하나의-통화에는-여러-시작-시점이-있다)
+- [3. 현재 Agent는 active를 어떻게 기다리는가](#3-현재-agent는-active를-어떻게-기다리는가)
+- [4. listener를 먼저 등록하고 기존 상태를 다시 읽는 이유](#4-listener를-먼저-등록하고-기존-상태를-다시-읽는-이유)
+- [5. active는 사람이 받았다는 뜻이 아니다](#5-active는-사람이-받았다는-뜻이-아니다)
+- [6. timeout은 숫자보다 소유권 문제다](#6-timeout은-숫자보다-소유권-문제다)
+- [7. 실패 상태를 정상 대화와 분리한다](#7-실패-상태를-정상-대화와-분리한다)
+- [8. cleanup callback은 실제 통화 경계 뒤에 놓는다](#8-cleanup-callback은-실제-통화-경계-뒤에-놓는다)
+- [9. 녹음과 대화 Agent도 같은 경계를 따라야 한다](#9-녹음과-대화-agent도-같은-경계를-따라야-한다)
+- [10. 무엇을 관찰하고 테스트해야 할까](#10-무엇을-관찰하고-테스트해야-할까)
+- [11. Agent가 직접 발신하는 구조와 비교한다](#11-agent가-직접-발신하는-구조와-비교한다)
+- [12. 아웃바운드 호출 수명주기를 위한 설계 원칙](#12-아웃바운드-호출-수명주기를-위한-설계-원칙)
+
+---
+
+## 1. 발신 주체와 대화 주체를 분리한다
+
+가장 단순한 LiveKit 아웃바운드 예제에서는 Agent가 직접 `CreateSIPParticipant`를 호출한다. `wait_until_answered=True`로 응답을 기다리고, 성공하면 SIP Participant가 Room에 들어왔는지 확인한 뒤 `AgentSession`을 시작한다.
+
+우리 환경의 책임 분리는 다르다.
+
+- `voxBridge`가 Room과 SIP 발신 수명주기를 조율한다.
+- `voxBridge`가 `CreateSIPParticipant`를 호출해 상대방에게 전화를 건다.
+- Agent dispatch와 SIP Participant 연결은 비동기로 진행될 수 있다.
+- outbound Agent는 같은 번호로 다시 전화를 걸지 않는다.
+- Agent는 Room에서 이미 생성됐거나 곧 생성될 SIP Participant를 기다린다.
+
+이 구조에서는 Agent가 발신까지 수행하면 안 된다. 두 서비스가 같은 통화를 각각 시작하면 중복 발신, 서로 다른 Participant identity, Room cleanup 경쟁이 생길 수 있다.
+
+핵심 계약은 다음과 같다.
+
+| 책임 | 소유자 | 설명 |
+|---|---|---|
+| 발신 요청과 SIP Participant 생성 | `voxBridge` | 전화번호, trunk, calling timeout과 pre-answer 결과 관리 |
+| Agent job 실행 | LiveKit AgentServer | 통화별 process와 `AgentSession` 준비 |
+| 연결 가능 상태 감지 | outbound Agent | Room의 SIP Participant와 `sip.callStatus` 관찰 |
+| 실제 AI 대화 | `SingleAgent` | 연결 후 인사, 업무 대화와 Tool 실행 |
+| 발신 실패 시 Room 정리 | `voxBridge` 중심 | timeout과 orphan cleanup의 기준 소유자 |
+| 연결 후 대화 분석 | outbound Agent와 분석 Consumer | 실제 대화가 존재하는 통화만 전달 |
+
+이 표에서 중요한 것은 구현 언어가 아니라 **한 단계에 한 명의 소유자만 두는 것**이다.
+
+## 2. 하나의 통화에는 여러 시작 시점이 있다
+
+아웃바운드 통화에서 “시작”이라는 말은 너무 넓다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    autonumber
+    participant O as voxBridge
+    participant L as LiveKit
+    participant A as Outbound Agent
+    participant S as SIP Provider
+    actor C as 수신자
+
+    O->>L: Room·SIP 발신·Agent dispatch 조율
+    L->>A: Agent job 시작
+    A->>A: AgentSession + 무발화 FakeAgent 준비
+    A->>L: SIP Participant와 callStatus 관찰
+    L->>S: SIP INVITE
+    S->>C: 전화 벨 울림
+    L-->>A: participant_connected 또는 attribute 변경
+    C->>S: 전화 응답
+    S-->>L: SIP 연결 성립
+    L-->>A: sip.callStatus = active
+    A->>A: 수신자 identity 저장·녹음 시작·AMD 실행
+    A->>A: human/uncertain이면 SingleAgent 활성화
+`} />
+
+이 시간선에는 적어도 다섯 개의 경계가 있다.
+
+1. **Job started**: Agent process가 실행되기 시작했다.
+2. **Participant appeared**: SIP Participant 객체가 Room에서 보인다.
+3. **SIP active**: SIP 계층에서 통화가 연결됐다.
+4. **Human or machine classified**: 실제 사람이 받았는지 자동응답인지 판별됐다.
+5. **Conversation started**: 업무용 `SingleAgent`가 대화를 시작했다.
+
+현재 outbound Agent는 `AgentSession`을 먼저 시작하되, instructions가 비어 있는 `FakeAgent`를 사용한다. 따라서 media session은 준비하면서도 업무 Agent가 인사말을 먼저 내보내지 않게 한다. 이후 SIP가 `active`가 되고 Answering Machine Detection 결과가 `human` 또는 `uncertain`일 때 `SingleAgent`로 교체한다.
+
+이처럼 준비와 발화를 분리하면 연결 지연을 줄이면서도 벨이 울리는 동안 AI 음성이 새어나가는 일을 막을 수 있다.
+
+## 3. 현재 Agent는 active를 어떻게 기다리는가
+
+`wait_for_callee()`는 Room event를 `asyncio.Future` 하나로 모은다.
+
+```python
+async def wait_for_callee(ctx: JobContext, timeout: float = 60.0):
+    room = ctx.room
+    fut: asyncio.Future[rtc.RemoteParticipant] = asyncio.Future()
+
+    def check(participant: rtc.Participant) -> None:
+        if fut.done():
+            return
+        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            return
+        if not isinstance(participant, rtc.RemoteParticipant):
+            return
+
+        status = participant.attributes.get("sip.callStatus", "")
+        if status == "active":
+            fut.set_result(participant)
+        elif status in TERMINAL_CALL_STATUSES:
+            fut.set_exception(CalleeNotAvailableError(status))
+```
+
+관찰하는 event는 두 개다.
+
+- `participant_connected`: SIP Participant가 Room에 새로 나타났다.
+- `participant_attributes_changed`: 이미 존재하는 Participant의 `sip.callStatus`가 바뀌었다.
+
+Participant 연결 event만 보면 부족하다. 객체가 나타났을 때 status가 아직 `dialing`일 수 있기 때문이다. 반대로 attribute 변경만 보면 listener를 붙이기 전에 이미 `active`가 된 Participant를 놓칠 수 있다.
+
+그래서 두 event를 모두 같은 `check()` 함수로 보낸다. `check()`는 Participant kind, remote 여부와 status를 한곳에서 검증한다. 성공과 실패가 결정되면 하나의 Future만 완료하므로 중복 event가 들어와도 결과를 다시 덮어쓰지 않는다.
+
+초기 구현은 250ms 간격의 polling이었다. 이후 Room event를 이용하는 구조로 바뀌었다. event-driven 방식은 상태 변경 직후 깨어나고 불필요한 반복 조회를 줄이지만, listener를 언제 등록하는지가 더 중요해진다.
+
+## 4. listener를 먼저 등록하고 기존 상태를 다시 읽는 이유
+
+비동기 상태를 기다릴 때 흔히 다음 순서로 작성하고 싶어진다.
+
+```text
+1. 현재 Participant 목록을 확인한다.
+2. 아직 없으면 listener를 등록한다.
+3. 다음 event를 기다린다.
+```
+
+그러나 1번과 2번 사이에 상태가 바뀌면 event를 영원히 놓칠 수 있다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    participant A as Agent
+    participant R as LiveKit Room
+
+    A->>R: 현재 목록 확인 — 아직 dialing
+    R-->>R: sip.callStatus가 active로 변경
+    Note over R: 이 순간에는 listener가 없음
+    A->>R: listener 등록
+    A->>A: 이미 지나간 event를 기다림
+`} />
+
+현재 helper는 반대 순서를 사용한다.
+
+1. `participant_connected` listener를 등록한다.
+2. `participant_attributes_changed` listener를 등록한다.
+3. 이미 Room에 있는 `remote_participants`를 다시 검사한다.
+4. Future가 완료되지 않았다면 새 event를 기다린다.
+5. 성공·실패·timeout 여부와 관계없이 `finally`에서 listener를 제거한다.
+
+이 패턴은 **subscribe-then-snapshot**으로 볼 수 있다. listener 등록 전의 상태는 snapshot이 보완하고, snapshot을 읽는 동안의 변화는 listener가 잡는다.
+
+단, 이 패턴도 event ordering 전체를 보장하는 것은 아니다. Participant가 사라진 뒤 뒤늦은 attribute event가 도착하거나 SDK가 상태 값을 다른 순서로 전달할 수 있다. 그래서 Future의 단일 완료 보장, timeout과 `finally` cleanup이 함께 필요하다.
+
+## 5. active는 사람이 받았다는 뜻이 아니다
+
+LiveKit 공식 문서에서 outbound call의 `sip.callStatus=active`는 SIP 통화가 연결됐다는 뜻이다. 상대방이 실제 사람인지까지 보장하지 않는다.
+
+음성사서함도 SIP 계층에서는 전화를 받는다. 통신사는 `200 OK`를 반환하고 Participant는 `active`가 될 수 있다. 따라서 다음 등식은 성립하지 않는다.
+
+```text
+sip.callStatus == active
+    ≠ 사람이 응답함
+    ≠ 업무 대화를 시작해도 됨
+```
+
+현재 outbound 흐름에서는 `active` 뒤에 Answering Machine Detection을 실행한다.
+
+<MermaidDiagram chart={`
+stateDiagram-v2
+    [*] --> WaitingForSIP
+    WaitingForSIP --> ConnectedAtSIP: sip.callStatus = active
+    WaitingForSIP --> PreAnswerFailed: terminal state
+    WaitingForSIP --> TimedOut: 60s timeout
+    ConnectedAtSIP --> DetectingAnswerType: AMD
+    DetectingAnswerType --> Conversation: human or uncertain
+    DetectingAnswerType --> MachineAnswered: voicemail or machine
+    Conversation --> [*]
+    PreAnswerFailed --> [*]
+    TimedOut --> [*]
+    MachineAnswered --> [*]
+`} />
+
+`active`는 중요한 gate지만 마지막 gate는 아니다. 이 구분이 있어야 “통화 연결률”과 “사람 응답률”을 같은 지표로 섞지 않을 수 있다.
+
+## 6. timeout은 숫자보다 소유권 문제다
+
+현재 `wait_for_callee()`의 기본 timeout은 60초다. 코드 주석은 `voxBridge`의 CALLING timeout 45초보다 길게 두는 이유를 설명한다.
+
+목표는 Agent가 더 오래 기다리게 만드는 것이 아니다. **발신 수명주기의 소유자인 `voxBridge`가 먼저 실패를 결정하게 하는 것**이다.
+
+두 서비스가 모두 45초에 timeout되면 다음 작업이 거의 동시에 시작될 수 있다.
+
+- `voxBridge`가 SIP Participant나 Room을 정리한다.
+- Agent가 `ctx.shutdown()`을 호출한다.
+- Room close 정책이 다른 Participant를 종료한다.
+- shutdown callback이 분석 메시지를 발행한다.
+- 별도 orphan sweeper가 같은 Room을 다시 정리한다.
+
+이때 어느 실패가 원인이고 어느 작업이 후속 cleanup인지 구분하기 어렵다.
+
+외부 timeout을 45초, Agent timeout을 60초로 둔 것은 15초를 더 허용하기 위한 성능 설정이 아니라 **결정권의 순서를 만드는 수명주기 설정**이다.
+
+다만 timeout 차이만으로 cleanup 경쟁이 사라지는 것은 아니다. Room 삭제, AgentSession close와 SIP Participant 제거를 누가 수행하는지까지 같은 계약으로 묶어야 한다. timeout 값만 다르고 양쪽 모두 Room을 삭제한다면 여전히 race가 남는다.
+
+## 7. 실패 상태를 정상 대화와 분리한다
+
+`entrypoint()`는 대기 결과를 세 갈래로 나눈다.
+
+| 결과 | 의미 | Agent 동작 |
+|---|---|---|
+| SIP `active` | SIP 계층 연결 성립 | identity 저장 후 녹음·AMD 단계로 이동 |
+| `CalleeNotAvailableError` | active 전에 terminal 상태 관찰 | 경고 event 기록 후 job shutdown |
+| `asyncio.TimeoutError` | 제한 시간 동안 active 미관찰 | timeout event 기록 후 job shutdown |
+| 그 밖의 예외 | listener·Room·SDK의 예상 밖 오류 | exception 포함 로그 후 job shutdown |
+
+프로젝트 helper는 `hangup`, `failed`, `busy`, `no-answer`, `cancelled`, `rejected`를 terminal 후보로 방어적으로 인식한다.
+
+여기에는 중요한 버전 주의점이 있다. 2026년 8월의 LiveKit 공식 문서는 `sip.callStatus`의 값으로 `active`, `automation`, `dialing`, `hangup`, `ringing`을 설명하고, 거절·무응답·trunk 실패는 `disconnect_reason` 또는 `SipCallError`로 구분한다. 따라서 프로젝트의 terminal 문자열 전체를 LiveKit 공식 상태 목록으로 일반화하면 안 된다.
+
+실제 시스템에서는 다음을 명시적으로 정해야 한다.
+
+- 어떤 값이 LiveKit SDK에서 오는가?
+- 어떤 값이 SIP provider 또는 `voxBridge`가 정규화한 값인가?
+- failure reason은 Participant attribute, disconnect reason, API exception 중 어디에서 읽는가?
+- 새 LiveKit 버전에서도 동일한 값이 유지되는가?
+
+외부 오케스트레이터와 Agent가 같은 실패를 다른 이름으로 저장하면 retry 정책과 분석 지표가 갈라진다. 상태 문자열을 늘리기 전에 **공통 outcome contract**부터 만들어야 한다.
+
+## 8. cleanup callback은 실제 통화 경계 뒤에 놓는다
+
+연결 전 실패에서 가장 조심해야 할 side effect는 shutdown callback이다.
+
+shutdown callback은 보통 다음 일을 수행한다.
+
+- 통화 종료 시각 기록
+- 대화 History와 Agent event 수집
+- 후처리 분석 Kafka message 발행
+- 녹음과 외부 자원 정리
+
+이 callback을 `wait_for_callee()` 전에 등록하면, no-answer나 busy로 `ctx.shutdown()`을 호출했을 때도 실행된다. 대화가 한 턴도 없는데 분석 파이프라인에는 “종료된 통화”가 들어갈 수 있다.
+
+저장소의 설계 문서는 callback 등록을 `active` 성공 경로 뒤로 옮기는 결정을 기록하고 있다.
+
+```python
+try:
+    participant = await wait_for_callee(ctx, timeout=60)
+except (asyncio.TimeoutError, CalleeNotAvailableError):
+    ctx.shutdown()
+    return
+
+# 실제 SIP 연결이 성립한 뒤에만 대화 후처리 callback을 등록한다.
+ctx.add_shutdown_callback(shutdown_callback)
+```
+
+그러나 2026년 8월 7일 현재 런타임 파일을 확인하면 callback 등록은 여전히 대기 코드보다 앞에 있다. 즉, 이 경계는 문서화된 설계 결정이지만 현재 코드에서 완료됐다고 단정할 수 없는 review item이다.
+
+이 차이가 주는 교훈은 두 가지다.
+
+첫째, 설계 문서가 있다고 invariant가 자동으로 생기지 않는다. 테스트와 코드 위치가 함께 보장해야 한다.
+
+둘째, callback은 단순한 종료 편의 기능이 아니다. **언제부터 이 job을 실제 대화로 간주할 것인가**를 결정하는 데이터 경계다.
+
+모든 cleanup을 늦게 등록해야 한다는 뜻은 아니다. 연결 전에도 반드시 정리해야 하는 listener나 임시 task가 있을 수 있다. 따라서 callback도 역할을 나누는 편이 안전하다.
+
+| Callback 종류 | 등록 시점 | 예시 |
+|---|---|---|
+| Process cleanup | job 시작 직후 | listener 해제, 내부 task cancel |
+| Pre-answer cleanup | 발신 대기 시작 전 | 임시 상태 제거, 발신 owner에 결과 통지 |
+| Conversation cleanup | SIP active 또는 대화 시작 뒤 | 녹음 종료, transcript·분석 event 발행 |
+
+## 9. 녹음과 대화 Agent도 같은 경계를 따라야 한다
+
+현재 코드에서 Room composite egress는 SIP Participant가 `active`가 된 뒤 background task로 시작한다. 그 전에 녹음을 시작하면 벨소리나 연결 전 무음이 실제 대화의 시작으로 저장될 수 있다.
+
+녹음 시작도 비동기이므로 또 다른 race가 있다.
+
+1. `active` 뒤 녹음 시작 task를 생성한다.
+2. 녹음 API 응답을 기다리는 동안 상대방이 바로 끊는다.
+3. session cleanup이 먼저 시작된다.
+4. 뒤늦게 egress 생성이 성공한다.
+
+현재 구현은 `session_closing`을 확인하고, 이미 세션이 닫히는 중이라면 늦게 생성된 egress를 즉시 정리하는 경로를 둔다. 이것은 `active` gate 뒤에서도 비동기 수명주기가 계속 존재한다는 예다.
+
+업무 Agent 활성화는 그보다 한 단계 더 늦다.
+
+```text
+SIP active
+  → 수신자 identity와 trunk 정보 저장
+  → 녹음 시작 예약
+  → Answering Machine Detection
+  → human / uncertain이면 SingleAgent 활성화
+  → voicemail이면 대화 없이 종료
+```
+
+따라서 분석에서도 다음 시간을 구분할 수 있어야 한다.
+
+- job이 시작된 시간
+- SIP 연결이 성립한 시간
+- AMD가 끝난 시간
+- 첫 Agent 발화가 시작된 시간
+- 실제 통화가 종료된 시간
+
+이 값들을 모두 `call_start_time` 하나로 뭉치면 발신 대기시간, 응답 후 준비시간과 실제 대화시간을 분리해 측정할 수 없다.
+
+## 10. 무엇을 관찰하고 테스트해야 할까
+
+현재 코드에는 다음과 같은 구조화 로그가 있다.
+
+- `OUTBOUND_WAIT_CALLEE_START`
+- `OUTBOUND_WAIT_CALLEE_SUCCESS`
+- `OUTBOUND_WAIT_CALLEE_TIMEOUT`
+- `OUTBOUND_WAIT_CALLEE_TERMINAL`
+- `WAIT_FOR_CALLEE_ACTIVE`
+- `AMD_RESULT`
+- `RECORDING_START_SUCCESS_BG`
+
+운영에서는 문자열 로그보다 이 event들의 관계가 중요하다.
+
+| 관찰 항목 | 답하려는 질문 |
+|---|---|
+| Job start → SIP active | 발신 대기와 dispatch 순서가 얼마나 걸렸는가? |
+| SIP active → AMD result | 상대방 유형 판정이 얼마나 걸렸는가? |
+| AMD result → 첫 Agent 음성 | 사람이 받은 뒤 실제 안내가 언제 시작됐는가? |
+| Terminal·timeout reason | 거절, 무응답과 trunk 실패를 구분할 수 있는가? |
+| Listener 등록·해제 수 | 완료된 job에 handler가 남아 있지 않은가? |
+| Pre-answer analysis publish | 대화 없는 통화가 분석 topic으로 들어가지 않는가? |
+
+전용 단위 테스트도 같은 경계를 검증해야 한다.
+
+1. listener 등록 전에 이미 `active`인 SIP Participant가 존재한다.
+2. Participant가 `dialing` 상태로 들어온 뒤 attribute가 `active`로 바뀐다.
+3. SIP가 아닌 Participant event는 무시한다.
+4. terminal 상태가 active보다 먼저 도착한다.
+5. 아무 event도 없으면 정확히 timeout된다.
+6. Future 완료 뒤 중복 event가 와도 결과가 바뀌지 않는다.
+7. 성공·terminal·timeout 모든 경로에서 listener가 제거된다.
+8. 연결 전 shutdown에서는 대화 분석 callback이 실행되지 않는다.
+
+2026년 8월 7일 현재 저장소에는 `wait_for_callee()`만을 대상으로 한 전용 테스트가 보이지 않는다. 따라서 위 목록은 이미 검증된 항목이 아니라, 현재 구조에서 우선 추가할 회귀 테스트 매트릭스다.
+
+## 11. Agent가 직접 발신하는 구조와 비교한다
+
+LiveKit 공식 아웃바운드 예제는 Agent 또는 backend가 `CreateSIPParticipant`를 호출하고 `wait_until_answered=True`로 결과를 기다리는 방식을 제공한다. Agent 안에서 발신한다면 `SipCallError`로 거절·무응답·SIP 실패를 받고, 성공 후 `JobContext.wait_for_participant()`로 Room 합류를 확인할 수 있다.
+
+이 방식은 발신 owner가 하나이므로 이해하기 쉽다.
+
+그렇다면 왜 별도 오케스트레이터를 둘까?
+
+- 캠페인과 발신 요청을 Agent 배포와 독립적으로 관리해야 한다.
+- trunk 선택, 동시 발신 제한과 재시도 정책을 중앙에서 제어해야 한다.
+- Agent가 시작되기 전부터 Room과 전화 상태를 추적해야 한다.
+- AI 대화가 시작되지 않은 실패도 업무 시스템에 결과로 돌려줘야 한다.
+- 여러 종류의 Agent가 같은 발신 인프라를 공유해야 한다.
+
+어느 구조가 더 좋은지는 요구사항에 따라 달라진다. 다만 두 방식을 섞으면 안 된다.
+
+| 구조 | 장점 | 주의점 |
+|---|---|---|
+| Agent-owned dialing | 코드 경로가 짧고 공식 예제와 가깝다 | 캠페인·trunk·retry 정책이 Agent에 결합될 수 있다 |
+| Orchestrator-owned dialing | 발신 정책과 AI 대화를 독립적으로 운영한다 | event ordering, timeout과 cleanup 계약이 추가된다 |
+
+선택 기준은 “누가 API를 호출하기 쉬운가”가 아니다.
+
+> **발신 실패부터 Room cleanup까지 하나의 주체가 일관되게 설명할 수 있는가?**
+
+## 12. 아웃바운드 호출 수명주기를 위한 설계 원칙
+
+### 1) Job dispatch와 통화 연결을 분리한다
+
+Agent process가 시작됐다는 이유로 greeting, 녹음과 분석을 시작하지 않는다.
+
+### 2) 발신 owner를 하나만 둔다
+
+외부 오케스트레이터가 `CreateSIPParticipant`를 호출한다면 Agent는 같은 전화를 다시 걸지 않는다.
+
+### 3) Participant 존재와 SIP active를 구분한다
+
+`participant_connected`와 `participant_attributes_changed`를 함께 관찰하고 status를 확인한다.
+
+### 4) subscribe-then-snapshot으로 event gap을 막는다
+
+listener를 먼저 등록한 뒤 이미 존재하는 Participant를 검사해 등록 시점 전후를 모두 포착한다.
+
+### 5) active와 human answered를 구분한다
+
+음성사서함도 SIP 계층에서는 active일 수 있으므로 AMD 또는 별도 정책이 필요하다.
+
+### 6) timeout 순서로 결정권을 표현한다
+
+안쪽 waiter보다 발신 owner가 먼저 timeout되게 하되, 실제 cleanup 권한도 같은 계약으로 맞춘다.
+
+### 7) failure vocabulary를 버전 관리한다
+
+`sip.callStatus`, `disconnect_reason`, `SipCallError`와 오케스트레이터 상태를 하나의 outcome schema로 정규화한다.
+
+### 8) side effect는 실제 경계 뒤에 둔다
+
+대화 분석, 예약 결과와 녹음 후처리는 실제 통화가 성립한 뒤에만 활성화한다.
+
+### 9) callback 등록 시점도 테스트한다
+
+설계 문서와 코드 위치가 어긋나지 않도록 pre-answer failure 테스트에서 분석 발행 여부를 검증한다.
+
+### 10) 시간 하나로 전체 수명주기를 표현하지 않는다
+
+job, SIP active, AMD, first speech와 disconnect를 서로 다른 timestamp로 관찰한다.
+
+## 마치며
+
+아웃바운드 Voice AI는 Agent가 먼저 말을 거는 시스템처럼 보인다. 그러나 좋은 아웃바운드 Agent가 처음 해야 할 일은 말하기가 아니라 기다리기다.
+
+무엇을 기다리는지가 중요하다.
+
+Room이 생기는 것만으로는 부족하다. SIP Participant가 나타나는 것만으로도 부족하다. `active`가 되어도 자동응답일 수 있다. 실제 대화를 시작하기 전까지는 발신, 연결, 응답 유형 판정이라는 서로 다른 상태가 순서대로 통과해야 한다.
+
+우리 구조에서는 `voxBridge`가 발신을 소유하고 outbound Agent는 Room event를 관찰한다. `wait_for_callee()`는 listener와 snapshot을 결합해 SIP Participant의 `active` 전환을 기다린다. timeout 순서는 `voxBridge`가 먼저 실패를 결정하도록 설계되어 있다. 녹음과 업무 Agent는 그 경계 뒤에서 시작한다.
+
+그리고 저장소의 callback 설계와 현재 코드 위치가 보여주듯, 수명주기 경계는 문서로만 유지되지 않는다. 코드, callback 등록 순서, 구조화 event와 회귀 테스트가 같은 결론을 보장해야 한다.
+
+아웃바운드 통화의 핵심 질문은 “전화를 걸었는가?”가 아니다.
+
+> **지금 이 시스템은 어느 단계에 있고, 다음 단계로 넘어갈 권한은 누구에게 있는가?**
+
+이 질문에 답할 수 있을 때 AI는 벨이 울리는 동안 말하지 않고, 받지 않은 전화를 분석하지 않으며, 실제 상대방이 준비된 순간에 대화를 시작할 수 있다.
+
+---
+
+## 참고 자료
+
+- [LiveKit: Make outbound calls](https://docs.livekit.io/telephony/making-calls/outbound-calls/)
+- [LiveKit: SIP participant attributes and disconnect reasons](https://docs.livekit.io/reference/telephony/sip-participant/)
+- [LiveKit Agents: Job lifecycle](https://docs.livekit.io/agents/server/job/)
