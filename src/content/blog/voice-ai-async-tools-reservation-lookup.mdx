@@ -1,7 +1,7 @@
 ---
 title: '예약 조회가 느릴 때 AI는 무엇을 말해야 할까?: LiveKit Async Tools로 dead air 줄이기'
 description: '병원 예약 API가 늦어질 때 무조건 기다리라는 말을 반복하지 않고, 진행 상태·filler speech·취소·중복 호출을 안전하게 설계하는 방법을 현재 예약 조회 구조와 함께 설명합니다.'
-pubDate: '2026-08-07'
+pubDate: '2026-08-04'
 heroImage: '../../assets/blog/voice-ai-async-tools-reservation-lookup-hero.png'
 ---
 
@@ -27,7 +27,7 @@ AI 상담원은 환자를 확인하고 병원 예약 시스템에 요청을 보�
 
 > 예약 API가 느릴 때 AI는 무엇을, 언제, 어떤 근거로 말해야 하는가?
 
-> **Version note:** 이 글은 2026년 8월 7일과 프로젝트에 고정된 `livekit-agents==1.6.8`을 기준으로 작성했습니다. LiveKit Async Tools는 빠르게 변하는 기능이므로 적용 전 최신 문서를 다시 확인해야 합니다.
+> **Version note:** 이 글은 2026년 8월 4일과 프로젝트에 고정된 `livekit-agents==1.6.8`을 기준으로 작성했습니다. LiveKit Async Tools는 빠르게 변하는 기능이므로 적용 전 최신 문서를 다시 확인해야 합니다.
 
 ## 목차
 
@@ -456,4 +456,3 @@ LiveKit의 `ctx.update()`와 `ctx.with_filler()`는 이 문장을 재생하는 �
 - [LiveKit Docs — Async tools](https://docs.livekit.io/agents/logic/tools/async/)
 - [LiveKit Blog — Understand and Improve Voice Agent Latency](https://livekit.com/blog/understand-and-improve-agent-latency)
 - [LiveKit Blog — Diagnosing Blocked Event Loops in LiveKit Agents](https://livekit.com/blog/diagnosing-blocked-event-loops)
-
