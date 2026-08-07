@@ -87,6 +87,44 @@ hr { border: 0; border-top: 1px solid var(--line); }
 .prose p { margin-bottom: 1.5rem; }
 .prose h2, .prose h3 { margin-top: 2.8rem; }
 
+.prose table {
+	display: block;
+	width: 100%;
+	max-width: 100%;
+	margin: 2rem 0;
+	border: 1px solid var(--ink);
+	border-collapse: separate;
+	border-spacing: 0;
+	overflow-x: auto;
+	overscroll-behavior-inline: contain;
+	-webkit-overflow-scrolling: touch;
+}
+
+.prose thead { background: var(--ink); color: var(--paper); }
+
+.prose th,
+.prose td {
+	min-width: 10rem;
+	padding: .85rem 1rem;
+	border-right: 1px solid var(--line);
+	border-bottom: 1px solid var(--line);
+	line-height: 1.55;
+	text-align: left;
+	vertical-align: top;
+	word-break: keep-all;
+	overflow-wrap: normal;
+}
+
+.prose th:first-child,
+.prose td:first-child { min-width: 12rem; }
+
+.prose th:last-child,
+.prose td:last-child { border-right: 0; }
+
+.prose tbody tr:last-child td { border-bottom: 0; }
+.prose tbody tr:nth-child(even) { background: rgba(23, 33, 27, .035); }
+.prose table code { white-space: nowrap; }
+
 @media (prefers-reduced-motion: no-preference) {
 	.reveal { animation: rise .7s both cubic-bezier(.2,.7,.2,1); }
 	.reveal-delay { animation-delay: .12s; }
