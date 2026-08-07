@@ -6,19 +6,25 @@ import { GITHUB_URL, SITE_TITLE } from '../consts';
 ---
 <!doctype html>
 <html lang="ko">
-	<head><BaseHead title={`소개 · ${SITE_TITLE}`} description="kofsitho87의 기술 블로그 소개" /></head>
+	<head><BaseHead title={`소개 · ${SITE_TITLE}`} description="Voice AI와 AI 제품을 설계하고 운영하는 소프트웨어 엔지니어 송희웅의 소개" /></head>
 	<body>
 		<Header />
 		<main>
 			<article class="about reveal">
 				<header>
-					<p class="eyebrow">About this log</p>
-					<h1>안녕하세요.<br />만들며 배우는<br /><em>개발자입니다.</em></h1>
+					<p class="eyebrow">Product engineer · Voice AI</p>
+					<h1>기술을<br />제품으로,<br /><em>운영까지.</em></h1>
 				</header>
 				<div class="copy">
-					<p class="lead">복잡한 기술을 직접 실험하고, 다시 꺼내 쓸 수 있는 언어로 정리합니다.</p>
-					<p>이곳에는 프로젝트를 만들며 마주친 문제, 해결 과정, 새롭게 배운 개념을 기록합니다. 완벽한 정답보다 실제로 도움이 된 과정에 집중합니다.</p>
-					<p>아직 소개할 내용을 정하는 중이라면 이 문장을 자유롭게 바꿔 주세요. 이 페이지는 <code>src/pages/about.astro</code>에 있습니다.</p>
+					<p class="lead">안녕하세요. 프론트엔드에서 시작해 백엔드와 인프라를 지나, 지금은 실시간 Voice AI 제품을 만들고 있는 소프트웨어 엔지니어 송희웅입니다.</p>
+					<p>9년 넘게 아이디어를 화면과 API, 운영 가능한 서비스로 연결해 왔습니다. 최근에는 병원 Voice AI 시스템의 설계부터 개발·배포·운영까지 맡아 100곳 이상의 병원에서 하루 약 2,000건의 통화를 처리하는 제품을 만들고 있습니다.</p>
+					<p>Multi-Agent 아키텍처, OpenAI Realtime API, LiveKit, LLM 기반 통화 분석처럼 <strong>AI가 실제 사용자와 만나는 지점</strong>에 관심이 많습니다. 기술 자체보다 지연 시간, 예외 상황, 관측 가능성처럼 프로덕션에서 제품의 완성도를 결정하는 문제를 깊이 파고듭니다.</p>
+
+					<section class="log-note" aria-labelledby="log-note-title">
+						<p class="eyebrow">What I write</p>
+						<h2 id="log-note-title">이곳에 기록하는 것</h2>
+						<p>이 블로그에는 Voice AI와 LLM 애플리케이션을 만들며 내린 설계 판단, 운영 중 마주친 실패, 다시 써먹을 수 있는 해결 과정을 남깁니다. 완벽한 정답보다 실제 제품을 한 걸음 앞으로 움직인 경험을 나눕니다.</p>
+					</section>
 					<a class="button" href={GITHUB_URL} target="_blank" rel="noreferrer">GitHub에서 보기 ↗</a>
 				</div>
 			</article>
@@ -32,7 +38,13 @@ import { GITHUB_URL, SITE_TITLE } from '../consts';
 	h1 em { color: var(--accent); font-weight: 400; }
 	.copy { max-width: 520px; padding-top: 2rem; border-top: 1px solid var(--ink); }
 	.lead { font-family: "Iowan Old Style", "Noto Serif KR", serif; font-size: 1.35rem; line-height: 1.55; }
+	.log-note { margin-top: 2.5rem; padding: 1.5rem 0 .25rem; border-top: 1px solid var(--line); }
+	.log-note .eyebrow { margin-bottom: .45rem; }
+	.log-note h2 { margin-bottom: .85rem; font-size: 1.7rem; }
 	.button { display: inline-block; margin-top: 1rem; padding: .75rem 1rem; color: var(--paper); background: var(--ink); text-decoration: none; }
 	.button:hover { background: var(--accent); color: var(--paper); }
-	@media (max-width: 720px) { .about { grid-template-columns: 1fr; gap: 2rem; } }
+	@media (max-width: 720px) {
+		.about { grid-template-columns: 1fr; gap: 2rem; }
+		.copy { padding-top: 1.5rem; }
+	}
 </style>
