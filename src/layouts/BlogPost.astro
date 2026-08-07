@@ -9,7 +9,7 @@ import { AUTHOR_NAME, SITE_TITLE } from '../consts';
 
 type Props = CollectionEntry<'blog'>['data'];
 
-const { title, description, pubDate, updatedDate, heroImage } = Astro.props;
+const { title, description, pubDate, updatedDate, heroImage, lang } = Astro.props;
 const canonicalURL = new URL(Astro.url.pathname, Astro.site);
 const articleSchema = {
 	'@context': 'https://schema.org',
@@ -32,7 +32,7 @@ const articleSchema = {
 };
 ---
 
-<html lang="ko">
+<html lang={lang}>
 	<head>
 		<BaseHead title={title} description={description} image={heroImage} type="article" />
 		<script type="application/ld+json" set:html={JSON.stringify(articleSchema)} />
