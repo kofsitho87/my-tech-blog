@@ -1,0 +1,508 @@
+---
+title: '전화가 동시에 몰리면 AI 상담원은 어떻게 버틸까?: 병원 Voice AI의 동시 통화 처리와 확장 설계'
+description: '한 통씩 길게 이어지는 병원 전화를 LiveKit Worker와 Kubernetes에서 격리·분산하고, 메모리·외부 API·상담원 회선까지 포함해 실제 수용량을 설계하는 방법을 설명합니다.'
+pubDate: '2026-08-07'
+heroImage: '../../assets/blog/voice-ai-concurrent-call-scaling-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+오전 진료가 시작되기 직전, 병원 전화가 한꺼번에 울립니다.
+
+- 예약 시간을 확인하려는 환자
+- 당일 진료 가능 여부를 묻는 환자
+- 예약을 변경하려는 환자
+- 상담원과 직접 통화하려는 환자
+
+사람 상담실이라면 누가 먼저 전화를 받을지, 통화 중인 상담원이 몇 명인지가 눈에 보입니다. Voice AI는 겉으로 한 명의 상담원처럼 들리지만, 내부에서는 통화마다 음성 스트림·STT·LLM·TTS·예약 조회·녹음·종료 후처리가 동시에 움직입니다.
+
+여기서 “서버를 한 대 더 늘리면 된다”는 답은 절반만 맞습니다. Pod가 늘어나도 STT 제공자의 동시 연결 한도, 예약 API 처리량, SIP Trunk, 사람 상담원의 수가 그대로라면 전체 서비스의 병목은 다른 곳으로 이동합니다. 반대로 한 Pod에서 너무 많은 통화를 받으면 CPU보다 먼저 메모리가 바닥나거나, 배포 중인 Pod가 통화와 함께 종료될 수 있습니다.
+
+와이즈에이아이 인바운드 에이전트는 LiveKit AgentServer를 Kubernetes에서 실행하고, 통화별 Job Process를 분리하며, Worker의 수용 상태와 사람 상담원의 점유 상태를 서로 다른 계층에서 제어합니다.
+
+이 글에서는 전화 한 통이 어떤 실행 단위로 분리되는지부터 Worker의 부하 판단, Process Pool의 메모리 비용, Kubernetes 수평 확장, Warm Transfer 대기열과 Graceful Shutdown까지 살펴보겠습니다.
+
+## 목차
+
+- [1. Voice AI의 확장 단위는 요청이 아니라 통화다](#1-voice-ai의-확장-단위는-요청이-아니라-통화다)
+- [2. LiveKit은 통화를 사용 가능한 Worker로 배정한다](#2-livekit은-통화를-사용-가능한-worker로-배정한다)
+- [3. 하나의 Pod 안에도 여러 종류의 Process가 있다](#3-하나의-pod-안에도-여러-종류의-process가-있다)
+- [4. Worker는 새 통화를 받을 수 있는지 먼저 판단한다](#4-worker는-새-통화를-받을-수-있는지-먼저-판단한다)
+- [5. Prewarm은 지연시간과 메모리를 맞바꾸는 선택이다](#5-prewarm은-지연시간과-메모리를-맞바꾸는-선택이다)
+- [6. 수평 확장은 Worker Pod를 늘리는 일이다](#6-수평-확장은-worker-pod를-늘리는-일이다)
+- [7. 실제 수용량은 가장 좁은 외부 의존성이 결정한다](#7-실제-수용량은-가장-좁은-외부-의존성이-결정한다)
+- [8. 상담원 연결은 별도의 점유 대기열이 필요하다](#8-상담원-연결은-별도의-점유-대기열이-필요하다)
+- [9. 배포할 때는 Pod가 아니라 통화를 먼저 종료해야 한다](#9-배포할-때는-pod가-아니라-통화를-먼저-종료해야-한다)
+- [10. OOM과 강제 종료는 격리 경계를 시험한다](#10-oom과-강제-종료는-격리-경계를-시험한다)
+- [11. CPU 사용률만으로는 수용량을 알 수 없다](#11-cpu-사용률만으로는-수용량을-알-수-없다)
+- [12. 동시 통화 테스트는 단계적으로 올려야 한다](#12-동시-통화-테스트는-단계적으로-올려야-한다)
+- [13. 병원 Voice AI 확장을 위한 설계 원칙](#13-병원-voice-ai-확장을-위한-설계-원칙)
+- [마치며](#마치며)
+
+---
+
+## 1. Voice AI의 확장 단위는 요청이 아니라 통화다
+
+일반적인 웹 API 요청은 수십 밀리초에서 수 초 안에 끝납니다. 같은 서버가 짧은 요청을 빠르게 바꿔 가며 처리할 수 있습니다.
+
+Voice AI의 통화는 다릅니다. 환자가 전화를 건 순간부터 끊을 때까지 하나의 세션이 계속 살아 있습니다. 그동안 시스템은 다음 자원을 유지합니다.
+
+- LiveKit Room과 SIP Participant 연결
+- 환자 음성을 받는 실시간 오디오 스트림
+- STT 스트리밍 연결과 Turn Detection 상태
+- LLM 대화 History와 Tool 실행 상태
+- TTS 스트리밍 출력
+- 예약 후보, 본인 확인 결과, 상담원 연결 상태
+- 통화 녹음과 종료 시 후처리 정보
+
+따라서 동시 통화 10건은 “같은 API를 10번 호출한 상태”가 아니라 **10개의 장기 실행 세션이 동시에 자원과 상태를 점유하는 상태**입니다.
+
+<MermaidDiagram chart={`
+flowchart LR
+    subgraph Calls["동시에 들어온 전화"]
+        C1["Call A"]
+        C2["Call B"]
+        C3["Call C"]
+    end
+
+    C1 --> J1["Job Process A"]
+    C2 --> J2["Job Process B"]
+    C3 --> J3["Job Process C"]
+
+    J1 --> S1["STT·LLM·TTS·Session State"]
+    J2 --> S2["STT·LLM·TTS·Session State"]
+    J3 --> S3["STT·LLM·TTS·Session State"]
+`} />
+
+확장 설계의 첫 번째 원칙은 통화를 서로 격리하는 것입니다. 한 환자의 예약 API 호출이 오래 걸리거나 Agent Task가 실패해도 다른 환자의 음성 처리가 함께 멈추지 않아야 합니다.
+
+---
+
+## 2. LiveKit은 통화를 사용 가능한 Worker로 배정한다
+
+LiveKit AgentServer는 시작할 때 LiveKit Server에 자신을 Worker로 등록하고 Job을 기다립니다. 전화가 연결되어 Agent Job이 필요해지면 LiveKit은 사용 가능한 Worker 중 하나에 Job을 배정합니다.
+
+한 Worker가 Job을 수락하면 별도의 Process에서 통화 Entrypoint가 실행됩니다. 현재 서비스의 Entrypoint는 Job Metadata에서 병원과 통화 설정을 읽고, SIP Participant를 기다린 뒤 오디오만 구독해 AgentSession을 시작합니다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    participant P as 환자 전화
+    participant LK as LiveKit Server
+    participant W1 as Worker Pod A
+    participant W2 as Worker Pod B
+    participant J as Job Process
+
+    P->>LK: SIP 통화·Room 생성
+    LK->>W1: Job 수용 가능 여부 요청
+    W1-->>LK: 현재 부하 기준 응답
+    alt Worker A가 사용 가능
+        LK->>W1: Job 배정
+        W1->>J: 독립 Process 시작
+        J->>P: AgentSession 연결
+    else Worker A가 가득 참
+        LK->>W2: 다른 Worker에 요청
+        W2-->>LK: 수락
+        W2->>J: 독립 Process 시작
+    end
+`} />
+
+LiveKit 공식 문서도 Self-hosted 환경에서 Worker Pool에 Job을 분산하고, AgentServer가 Job마다 별도 Process를 만든다고 설명합니다. Job 하나가 비정상 종료되어도 같은 Worker의 다른 Job에 바로 영향을 주지 않는 이유가 이 격리 구조에 있습니다. 자세한 내용은 [LiveKit Self-hosted deployments](https://docs.livekit.io/deploy/custom/deployments/)와 [Job lifecycle](https://docs.livekit.io/agents/server/job/)에서 확인할 수 있습니다.
+
+다만 Job Process 격리는 Pod 장애까지 막아 주지는 않습니다. Pod 자체가 OOM으로 종료되면 그 안의 모든 Job Process도 함께 사라집니다. 그래서 Process 격리와 Pod 확장은 서로 다른 문제로 다뤄야 합니다.
+
+---
+
+## 3. 하나의 Pod 안에도 여러 종류의 Process가 있다
+
+LiveKit Agent Pod 하나를 단일 Python Process로 생각하면 메모리와 동시성을 잘못 계산하게 됩니다.
+
+프로젝트의 OOM 조사에서 확인한 구조는 다음과 같습니다.
+
+| Process | 역할 | 확장 시 변화 |
+| --- | --- | --- |
+| Main Worker | LiveKit 등록, Job 수용과 라우팅 | Pod마다 1개 |
+| Inference Process | Turn Detector 추론 | Pod 안에서 공유 |
+| Idle Prewarm Process | 새 통화를 빠르게 시작하기 위한 대기 Process | 설정과 CPU에 따라 여러 개 |
+| Active Job Process | 실제 통화의 AgentSession 실행 | 동시 Job 수만큼 증가 |
+| Resource Tracker | 멀티프로세스 자원 정리 | Pod마다 존재 |
+
+<MermaidDiagram chart={`
+flowchart TD
+    subgraph Pod["Agent Worker Pod"]
+        M["Main Worker"]
+        I["Shared Inference Process"]
+
+        subgraph Pool["Job Process Pool"]
+            P1["Idle Prewarm"]
+            P2["Idle Prewarm"]
+            A1["Active Call A"]
+            A2["Active Call B"]
+        end
+
+        M --> Pool
+        A1 --> I
+        A2 --> I
+    end
+`} />
+
+현재 `prewarm` 함수는 각 Job Process에 Silero VAD를 미리 로딩합니다. 이 덕분에 Job이 배정된 뒤 모델을 처음 읽는 시간을 줄일 수 있지만, 대기 중인 Process도 메모리를 사용합니다.
+
+또한 통화가 시작되면 FAQ 조회, 녹음 설정, STT·LLM·TTS 연결, 예약 API Client와 같은 세션별 자원이 추가됩니다. 일부 모델이나 Client가 지연 로딩된다면 유휴 상태와 첫 Tool 실행 이후의 메모리도 달라질 수 있습니다.
+
+즉, Pod 메모리는 “통화 한 건의 메모리 × 동시 통화 수”만으로 계산할 수 없습니다.
+
+> Pod 고정 비용 + 공유 추론 비용 + Prewarm 비용 + Active Job 비용을 따로 계산해야 한다.
+
+---
+
+## 4. Worker는 새 통화를 받을 수 있는지 먼저 판단한다
+
+Worker가 이미 한계에 도달했는데 계속 Job을 수락하면 기존 통화까지 느려지거나 Pod가 종료될 수 있습니다. 그래서 LiveKit Worker는 자신의 부하를 LiveKit Server에 알리고, 임계값에 도달하면 새 Job을 받지 않습니다.
+
+현재 운영 Entrypoint는 기본 CPU 부하 대신 `active_jobs` 개수를 이용하는 사용자 정의 부하 함수를 사용합니다.
+
+- 현재 Job 수를 기준값 5로 나눕니다.
+- 계산 결과는 0과 1 사이로 제한합니다.
+- `load_threshold`는 1.0입니다.
+- 설치된 SDK는 예약되었지만 아직 Active 목록에 나타나지 않은 Job 슬롯도 유효 부하에 반영합니다.
+
+여기서 `active_jobs`는 환자와 이미 대화 중인 통화만 뜻하지 않습니다. SIP Participant 합류를 기다리는 Setup Job도 포함될 수 있습니다. 따라서 “동시 통화 수”와 “Active Job 수”는 같은 숫자라고 가정하면 안 됩니다.
+
+<MermaidDiagram chart={`
+flowchart LR
+    R["새 Job 요청"] --> L["현재 Active Job과 예약 슬롯으로<br/>유효 부하 계산"]
+    L --> T{"임계값보다 낮은가?"}
+    T -->|"예"| A["Job 수락·Process 배정"]
+    T -->|"아니요"| F["Worker를 Full로 표시"]
+    F --> N["LiveKit이 다른 Worker 탐색"]
+`} />
+
+이 방식은 통화 수를 직접 제한하기 쉽다는 장점이 있습니다. 하지만 모든 통화의 비용이 같다는 가정이 숨어 있습니다.
+
+- FAQ 안내만 하는 짧은 통화
+- 여러 번 일정 API를 호출하는 예약 통화
+- Warm Transfer 대기음과 SIP Dial을 유지하는 긴 통화
+
+세 통화는 Active Job 한 건으로는 같지만 실제 메모리, 네트워크, 외부 API 비용은 다릅니다. 따라서 Job 개수는 Admission Control의 1차 기준으로 쓰고, 메모리와 외부 의존성 지표를 별도로 관찰해야 합니다.
+
+---
+
+## 5. Prewarm은 지연시간과 메모리를 맞바꾸는 선택이다
+
+새 Job마다 Process를 만들고 VAD 모델을 로딩하면 첫 응답이 늦어질 수 있습니다. LiveKit은 이를 줄이기 위해 미리 초기화된 Idle Process Pool을 유지할 수 있습니다.
+
+문제는 Warm Process도 공짜가 아니라는 점입니다.
+
+2026년 6월 QA 컨테이너에서 수행한 OOM 조사에서는 다음 값이 관측됐습니다. 이 수치는 당시 라이브러리·모델·컨테이너 설정에서 측정한 값이며, 일반적인 LiveKit 성능 Benchmark가 아닙니다.
+
+| 당시 측정 항목 | 관측 RSS |
+| --- | ---: |
+| Main Worker | 약 349MB |
+| Turn Detector Inference Process | 약 892MB |
+| Idle Prewarm Process 1개 | 약 265MB |
+| Idle Prewarm 3개 포함 유휴 합계 | 약 2.05GB |
+
+당시 QA Pod의 메모리 제한은 2Gi였기 때문에 통화를 받기 전부터 한계에 가까웠습니다. 조사 결과는 Idle Process 수를 1개로 줄이고 Pod 메모리 제한을 재산정하는 방안을 권장했습니다.
+
+현재 운영 AgentServer 코드에서는 `num_idle_processes`를 명시하지 않으므로, 실제 개수는 SDK의 Production 기본값과 할당 CPU에 영향을 받습니다. 따라서 배포 리소스를 바꾸면 Prewarm Process 수와 유휴 메모리도 함께 다시 확인해야 합니다.
+
+| 선택 | 장점 | 비용 |
+| --- | --- | --- |
+| Idle Process 0개 | 유휴 메모리 최소 | 첫 통화가 Cold Start를 부담 |
+| 소수 유지 | 평상시 통화를 빠르게 시작 | 고정 메모리 증가 |
+| 피크만큼 많이 유지 | 순간적인 동시 유입에 빠르게 대응 | 유휴 상태에서도 큰 메모리 사용 |
+
+Prewarm 수는 평균 동시 통화 수가 아니라 **짧은 시간에 새로 시작되는 통화 수와 허용 가능한 Cold Start**를 기준으로 정해야 합니다.
+
+---
+
+## 6. 수평 확장은 Worker Pod를 늘리는 일이다
+
+한 Worker 안의 Job 수를 무한히 늘리는 방식은 Process 격리의 장점보다 메모리 경쟁의 위험을 키웁니다. 일정 수준부터는 Kubernetes에서 Worker Pod 수를 늘려야 합니다.
+
+<MermaidDiagram chart={`
+flowchart TD
+    LK["LiveKit Job Dispatcher"] --> W1["Worker Pod A"]
+    LK --> W2["Worker Pod B"]
+    LK --> W3["Worker Pod C"]
+
+    W1 --> J11["Call 1"]
+    W1 --> J12["Call 2"]
+    W2 --> J21["Call 3"]
+    W2 --> J22["Call 4"]
+    W3 --> J31["Warm Capacity"]
+`} />
+
+LiveKit은 각 AgentServer의 가용 상태를 바탕으로 Job을 분산합니다. Kubernetes는 AgentServer 자체의 수를 늘리거나 줄이는 역할을 맡습니다.
+
+이때 Worker의 Full 기준과 Autoscaler의 Scale-out 기준을 같은 값으로 두면 늦습니다. 모든 Worker가 더 이상 Job을 받지 않는 시점에 새 Pod를 만들기 시작하면 이미지 Pull, Process 시작, 모델 Prewarm이 끝날 때까지 빈 용량이 없습니다.
+
+LiveKit 공식 Self-hosted 배포 가이드도 Autoscaler가 Worker의 `load_fnc`와 같은 기반 지표를 사용하되, `load_threshold`보다 낮은 지점에서 확장을 시작하도록 권장합니다. Scale-up은 빠르게, Scale-down은 통화 Drain 시간을 고려해 보수적으로 설정해야 합니다.
+
+다만 이 저장소에는 Kubernetes HPA나 Deployment Manifest가 포함되어 있지 않습니다. 따라서 다음 내용은 현재 적용 상태가 아니라 운영 환경에서 확인해야 할 설계 조건입니다.
+
+- 최소 Warm Pod 수
+- Scale-out 시작 임계값
+- 최대 Replica 수
+- 새 Pod가 Ready가 되기까지 걸리는 시간
+- Scale-down 안정화 구간
+- `terminationGracePeriodSeconds`
+
+---
+
+## 7. 실제 수용량은 가장 좁은 외부 의존성이 결정한다
+
+Worker Pod가 충분해도 통화가 의존하는 외부 시스템이 먼저 한계에 도달할 수 있습니다.
+
+| 의존성 | 통화 증가 시 늘어나는 부하 | 확인할 제한 |
+| --- | --- | --- |
+| LiveKit·SIP | Room, Participant, 오디오 Track | 동시 Room·SIP 연결·Trunk 수 |
+| STT | 통화별 스트리밍 연결 | 동시 Stream, Rate Limit, 재연결 비용 |
+| LLM | 발화마다 추론 요청 | 요청·Token 제한, 제공자 장애와 Fallback 용량 |
+| TTS | 답변마다 음성 Streaming | 동시 합성, 첫 Audio 지연, 오류율 |
+| 병원 예약 API | 환자·진료 항목·일정 조회 | 동시 요청, Timeout, 병원별 Backend 용량 |
+| 녹음·S3 | 통화별 Egress와 파일 저장 | Egress 수, 업로드 완료 시간 |
+| Kafka | 통화 종료 후 분석 Payload | 전송 지연, 실패, Consumer Lag |
+| Redis | Warm Transfer Queue 상태 | 연결 수, 응답 지연, 장애 시 대체 경로 |
+| 사람 상담원 | Warm Transfer의 실제 처리자 | 근무 인원과 동시 상담 가능 수 |
+
+예를 들어 Pod를 두 배로 늘렸는데 예약 API가 같은 시간에 처리할 수 있는 요청 수는 그대로라면, 예약 통화에서 Timeout과 재시도가 늘어납니다. 재시도는 다시 부하를 만들고, 더 많은 Job이 오래 살아남아 Worker 수용량까지 차지합니다.
+
+이런 연쇄를 막으려면 각 외부 호출에 Timeout과 제한된 재시도, 명확한 실패 상태, 대체 경로가 필요합니다. 이 부분은 [Voice AI는 장애가 나도 통화를 이어가야 한다](/my-tech-blog/blog/voice-ai-resilience-and-failure-recovery/)에서 더 자세히 다뤘습니다.
+
+> 서비스 수용량은 가장 많은 Pod 수가 아니라, 통화 경로에서 가장 먼저 포화되는 자원이 결정한다.
+
+---
+
+## 8. 상담원 연결은 별도의 점유 대기열이 필요하다
+
+AI 통화는 Worker Pod를 늘려 병렬 처리할 수 있지만 사람 상담원 한 명은 동시에 여러 환자와 통화할 수 없습니다. 그래서 일반 통화 확장과 Warm Transfer 확장은 같은 방식으로 풀 수 없습니다.
+
+초기 구조에서 여러 AI 통화가 같은 상담원 번호로 동시에 Dial하면 다음 문제가 생길 수 있습니다.
+
+- 여러 환자가 동시에 상담원에게 연결을 시도함
+- 상담원이 한 환자를 받은 직후 다른 전화가 다시 울림
+- 뒤에 요청한 환자가 먼저 연결될 수 있음
+- 어떤 세션이 실제 상담원을 점유 중인지 Pod 간에 알 수 없음
+
+현재 Warm Transfer는 회사별 Redis ZSET FIFO 대기열과 Trunk Allocation API를 사용합니다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    participant A as 환자 A
+    participant B as 환자 B
+    participant Q as Redis FIFO
+    participant T as Trunk Gate
+    participant H as 상담원
+
+    A->>Q: Enqueue
+    B->>Q: Enqueue
+    Q-->>A: rank 0 · 점유권
+    Q-->>B: rank 1 · 대기
+    A->>T: 가용 Trunk 확인
+    T->>H: Dial
+    H-->>A: Warm Transfer 수락
+    Note over A,Q: SUCCESS 후에도 선두 유지
+    H-->>A: 상담 진행
+    A->>Q: 상담 종료 후 Dequeue
+    Q-->>B: 다음 rank 0
+`} />
+
+핵심은 상담원이 전화를 받은 `SUCCESS` 시점에 대기열에서 빼지 않는 것입니다. 실제 상담이 끝날 때까지 선두를 유지해야 다음 환자가 같은 상담원에게 새 Dial을 보내지 않습니다. 이때 FIFO의 선두는 단순한 “다음 시도 순서”가 아니라 **상담원 점유 Lock**에 가깝습니다.
+
+AI Worker 용량과 사람 상담원 용량을 분리하면 두 가지를 동시에 달성할 수 있습니다.
+
+- 일반 안내와 예약 통화는 여러 Worker에서 병렬 처리
+- 사람 연결은 실제 상담원 수용량에 맞춰 직렬화 또는 제한
+
+---
+
+## 9. 배포할 때는 Pod가 아니라 통화를 먼저 종료해야 한다
+
+웹 서버는 Rolling Update 중 기존 Pod를 빠르게 교체해도 짧은 요청 몇 건만 재시도하면 되는 경우가 많습니다. Voice AI Pod에는 몇 분째 진행 중인 환자 통화가 있을 수 있습니다.
+
+LiveKit AgentServer의 Production `start` 모드는 종료 신호를 받으면 새 Job 수용을 멈추고 기존 Job이 끝나기를 기다리는 Drain 절차를 제공합니다. 현재 Dockerfile도 AgentServer를 `start` 모드로 실행합니다.
+
+<MermaidDiagram chart={`
+flowchart LR
+    S["SIGTERM 수신"] --> U["Worker Unavailable"]
+    U --> N["새 Job은 다른 Worker로"]
+    U --> D["기존 통화 Drain"]
+    D --> E["AgentSession 종료"]
+    E --> H["Shutdown Callback"]
+    H --> R["녹음 정리"]
+    H --> K["Kafka 분석 Payload 전송"]
+    R --> X["Job Process 종료"]
+    K --> X
+    X --> P["Pod 종료"]
+`} />
+
+중요한 시간 제한은 두 종류입니다.
+
+1. **Worker Drain 시간**: 기존 통화가 자연스럽게 끝날 수 있는 시간
+2. **Job Shutdown 시간**: 개별 통화가 끝난 뒤 Hook과 연결을 정리하는 시간
+
+LiveKit의 [Server startup modes](https://docs.livekit.io/agents/server/startup-modes/) 문서는 Production 모드에서 새 Job 수용 중지, Active Job 대기, 연결 정리 순서로 종료한다고 설명합니다. Kubernetes에서는 Pod의 `terminationGracePeriodSeconds`가 이 Drain 시간보다 짧지 않아야 합니다.
+
+현재 통화별 Shutdown Callback은 종료 시각을 기록하고, 녹음 중지 작업을 시작하며, 안전하게 정제한 세션 데이터·대화·Agent Event를 Kafka 분석 Topic으로 보냅니다. Pod가 이 작업 전에 강제로 종료되면 통화 자체는 끝났더라도 분석 데이터가 빠질 수 있습니다.
+
+따라서 배포 완료 시간만 줄이기 위해 Grace Period를 짧게 잡으면 안 됩니다. 먼저 새 통화를 다른 Pod로 보내고, 기존 통화와 후처리가 끝난 뒤 Process를 닫아야 합니다.
+
+---
+
+## 10. OOM과 강제 종료는 격리 경계를 시험한다
+
+통화별 Process는 한 Job의 예외가 다른 통화로 퍼지는 것을 줄입니다. 하지만 Pod 메모리가 한계를 넘으면 Kernel이 컨테이너 전체를 종료할 수 있습니다. 이때 Process 격리는 보호막이 되지 못합니다.
+
+과거 QA·운영 조사에서 확인한 주요 위험은 다음과 같습니다.
+
+- CPU 기준으로 늘어난 Idle Prewarm Process가 유휴 메모리를 예상보다 크게 사용
+- 통화가 시작될 때 Job Process와 지연 로딩 모델 메모리가 추가
+- 통화 종료 중 외부 연결이나 Task가 남아 Process 종료가 지연
+- 강제 Kill 전에 Shutdown Callback이 실행되지 않아 Kafka 후처리 누락
+
+특히 “종료 Timeout을 늘리면 해결된다”는 가정은 항상 맞지 않습니다. 실제로 Warm Transfer 안내 중 환자가 끊었지만 `wait_for_playout()`이 예외 없이 반환되어, 이미 닫힌 세션에서 새 Transfer Task를 시작한 사례가 있었습니다. Process는 그 Task를 기다리다 종료 제한을 넘었고 강제로 종료됐습니다.
+
+해결은 Timeout을 늘리는 것이 아니라, 발화 뒤 SIP Participant가 여전히 연결되어 있는지 다시 확인하고 끊겼다면 다음 Task를 시작하지 않는 것이었습니다.
+
+이 사례가 주는 확장 관점의 교훈은 분명합니다.
+
+- 종료 경로도 정상 업무 경로만큼 테스트해야 합니다.
+- 연결 해제는 예외 발생 여부가 아니라 실제 Participant 상태로 판단해야 합니다.
+- Cleanup은 중복 호출되어도 안전해야 합니다.
+- Process별 메모리 경고와 상한을 검토해야 합니다.
+- OOMKilled·Exit 137은 개별 통화 오류가 아니라 Pod 용량 오류로 분류해야 합니다.
+
+---
+
+## 11. CPU 사용률만으로는 수용량을 알 수 없다
+
+Voice AI는 외부 API 대기 시간이 길고 Process별 고정 메모리가 큽니다. CPU가 낮아 보여도 다음 통화를 받을 메모리가 없거나, 모든 STT 연결 한도를 사용하고 있을 수 있습니다.
+
+운영에서 함께 봐야 할 지표는 다음과 같습니다.
+
+| 계층 | 핵심 지표 | 알려주는 것 |
+| --- | --- | --- |
+| 유입 | 분당 신규 통화, 동시 Room, Setup Job 수 | 얼마나 빠르게 용량이 필요한가 |
+| Worker | Active Job, 유효 부하, Full 상태 시간 | 새 Job을 받을 수 있는가 |
+| Process | Pod RSS, Job별 RSS, Idle Process 수 | OOM까지 얼마나 남았는가 |
+| 시작 | Job 배정부터 Session Ready까지 시간 | Cold Start와 Prewarm이 충분한가 |
+| 음성 | STT·LLM·TTS 지연과 오류율 | 품질 저하가 어디서 시작됐는가 |
+| 업무 API | 요청 수, Timeout, 결과 없음, 오류 | 병원 Backend가 병목인가 |
+| Transfer | Queue 길이, 대기 시간, Timeout, Trunk 상태 | 사람 상담 용량이 부족한가 |
+| 종료 | Shutdown Callback 실행, Kafka 전송 성공 | Drain과 후처리가 완전한가 |
+| Kubernetes | Pending Pod, Restart, OOMKilled, Ready 시간 | 인프라 확장이 실제로 따라오는가 |
+
+Autoscaler는 Worker가 사용하는 부하 지표와 연결되어야 합니다. Worker는 Active Job 수로 가득 찼다고 판단하는데 HPA는 CPU만 보고 있다면, CPU가 낮다는 이유로 Pod를 늘리지 않을 수 있습니다.
+
+반대로 Active Job 수만 보면 메모리 비용이 큰 예약 통화나 Warm Transfer 통화가 몰리는 상황을 놓칠 수 있습니다. 따라서 **Job 수를 1차 Admission 지표로 사용하고, 메모리·지연·오류·대기열을 보호 지표로 결합하는 방식**이 적절합니다.
+
+---
+
+## 12. 동시 통화 테스트는 단계적으로 올려야 한다
+
+단일 통화가 정상이라고 해서 20통화도 정상이라는 보장은 없습니다. 하지만 처음부터 큰 숫자로 밀어 넣으면 어디에서 포화가 시작됐는지 알기 어렵습니다.
+
+동시 통화 검증은 다음 순서로 진행하는 편이 좋습니다.
+
+### 1단계: 유휴 비용 측정
+
+통화가 없을 때 Main Worker, Inference Process, Idle Process의 개수와 메모리를 기록합니다. 이것이 Pod의 고정 비용입니다.
+
+### 2단계: 통화 한 건의 증가분 측정
+
+일반 FAQ, 예약 조회, 신규 예약, Warm Transfer처럼 서로 다른 시나리오를 한 건씩 실행해 Process RSS, 외부 연결, 첫 응답 시간을 비교합니다.
+
+### 3단계: 계단식 동시성 증가
+
+1건, 2건, 4건처럼 단계적으로 올리면서 각 단계가 안정화된 뒤 지표를 수집합니다. 한 번에 여러 설정을 바꾸지 않습니다.
+
+### 4단계: 순간 유입 Burst 검증
+
+이미 연결된 통화 수뿐 아니라 짧은 시간에 여러 Job이 동시에 시작될 때 Reserved Slot, Prewarm 고갈, 새 Process 초기화 시간이 어떻게 변하는지 봅니다.
+
+### 5단계: 외부 의존성 제한 검증
+
+STT·LLM·TTS와 예약 API에 실제로 허용된 범위 안에서 부하를 주고, Timeout과 Rate Limit이 통화 전체로 번지지 않는지 확인합니다.
+
+### 6단계: 배포와 장애를 함께 검증
+
+통화가 진행 중일 때 Rolling Update, Pod 종료, Redis 일시 장애, Kafka 지연을 재현해 Drain과 대체 경로를 확인합니다.
+
+<MermaidDiagram chart={`
+flowchart LR
+    I["Idle Baseline"] --> O["1 Call"]
+    O --> S["Step Load"]
+    S --> B["Burst Start"]
+    B --> D["Dependency Limits"]
+    D --> R["Rollout·Failure"]
+    R --> C["Capacity Envelope"]
+`} />
+
+최종 결과는 “최대 몇 통” 하나가 아니라 다음 조건을 포함한 Capacity Envelope여야 합니다.
+
+- 어떤 통화 시나리오 조합인지
+- Pod CPU와 메모리 설정이 무엇인지
+- Prewarm Process가 몇 개인지
+- 허용한 지연시간과 오류율이 얼마인지
+- 외부 API와 상담원 용량이 어느 정도인지
+- 배포 중에도 유지해야 하는 최소 여유 용량이 얼마인지
+
+---
+
+## 13. 병원 Voice AI 확장을 위한 설계 원칙
+
+### 1) 통화마다 실행 상태를 격리한다
+
+한 통화의 오류와 긴 대기가 다른 통화의 이벤트 루프와 상태를 오염시키지 않게 합니다.
+
+### 2) Worker가 한계 전에 새 Job 수용을 멈추게 한다
+
+기존 통화 품질을 희생하면서 마지막 한 건을 더 받지 않습니다.
+
+### 3) Prewarm 수와 메모리를 함께 계산한다
+
+Cold Start를 줄이기 위해 만든 대기 Process가 Pod를 OOM으로 만들지 않게 합니다.
+
+### 4) Scale-out은 Full 임계값보다 먼저 시작한다
+
+새 Pod의 이미지 Pull, Process 시작, 모델 Prewarm 시간을 용량 계획에 포함합니다.
+
+### 5) Scale-down은 통화 Drain보다 느리게 한다
+
+Replica를 줄이는 속도보다 진행 중인 환자 통화를 안전하게 끝내는 것이 우선입니다.
+
+### 6) 외부 의존성마다 별도 용량 한도를 둔다
+
+STT·LLM·TTS·예약 API·SIP Trunk를 Worker Pod 수와 독립적으로 측정합니다.
+
+### 7) AI 통화 용량과 사람 상담 용량을 구분한다
+
+일반 통화는 병렬 처리하되, 상담원 연결은 점유 대기열로 실제 인력 수를 보호합니다.
+
+### 8) Shutdown Hook을 짧고 관찰 가능하게 만든다
+
+녹음 정리와 Kafka 전달의 성공 여부를 기록하고, 강제 종료 전에 끝날 수 있도록 합니다.
+
+### 9) 정상 종료와 조기 종료를 모두 테스트한다
+
+환자가 인사말 중 끊거나 Transfer 직전에 끊는 경로도 Capacity Test에 포함합니다.
+
+### 10) 최대치보다 안전 여유를 운영 기준으로 삼는다
+
+측정된 최대 통화 수를 그대로 배포 한도로 사용하지 않고, Burst와 배포 중 Replica 감소를 감당할 여유를 남깁니다.
+
+---
+
+## 마치며
+
+전화가 동시에 몰릴 때 Voice AI가 버티는 힘은 단순히 큰 서버에서 나오지 않습니다.
+
+LiveKit은 통화마다 독립된 Job Process를 만들고 사용 가능한 Worker로 분산합니다. Kubernetes는 Worker Pod 수를 조절합니다. Prewarm Process는 첫 응답을 빠르게 만들지만 유휴 메모리를 사용합니다. STT·LLM·TTS와 병원 API는 Pod와 별개의 한계를 가지며, 사람 상담원은 Redis 기반 점유 대기열로 보호해야 합니다. 배포할 때는 새 Job 수용을 먼저 멈추고 기존 통화와 종료 후처리를 Drain해야 합니다.
+
+결국 동시 통화 확장은 하나의 숫자를 키우는 문제가 아닙니다.
+
+> 통화 Process, Worker, Pod, 외부 API, SIP 회선, 사람 상담원이라는 서로 다른 용량 경계를 같은 시간선에서 맞추는 일이다.
+
+각 경계가 어디에서 포화되고 어떻게 다음 계층으로 신호를 전달하는지 알 수 있을 때, 갑자기 전화가 몰려도 기존 환자의 통화 품질을 지키면서 새로운 통화를 안전하게 받을 수 있습니다.
+
