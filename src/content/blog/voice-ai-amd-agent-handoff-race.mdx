@@ -1,0 +1,546 @@
+---
+title: 'AI가 설정된 인사말 대신 마음대로 말한 이유: AMD와 Agent 전환 사이의 첫 발화 Race Condition'
+description: '자동응답기 판별 중 들어온 첫 발화가 Agent 교체 이후 완료되면서, 설정된 인사말 대신 LLM의 즉흥 응답이 재생된 장애를 타임라인·메트릭·코드로 추적합니다.'
+lang: 'ko'
+pubDate: '2026-08-08'
+heroImage: '../../assets/blog/voice-ai-amd-agent-handoff-race-hero.png'
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+설정에는 분명히 인사말이 있었다.
+
+Agent는 그 문장을 그대로 `say()`로 재생해야 했다. 그런데 실제 통화에서는 설정 문장이 아니라 LLM이 즉석에서 만든 다른 메뉴 안내가 나왔다. 일부 선택지의 의미까지 임의로 채워 넣었다.
+
+겉으로 보면 단순한 프롬프트 문제처럼 보인다. 인사말을 더 강하게 지시하거나 temperature를 낮추면 해결될 것 같았다.
+
+하지만 메트릭과 event 시간을 맞춰 보니 원인은 프롬프트가 아니었다.
+
+상대방이 자동응답기 판별 중에 짧게 말한 “여보세요?”가 아직 하나의 user turn으로 확정되지 않은 채 남아 있었다. 그사이 active Agent는 두 번 바뀌었다. 뒤늦게 End of Utterance가 확정됐을 때 그 발화를 처리한 주체는 판별용 Agent가 아니라 DTMF 인사말 Task였다.
+
+그 Task는 원래 설정 문장만 재생해야 했다. 그러나 지연되어 도착한 user turn을 일반 대화 입력으로 받아 LLM 응답을 생성했다. preemptive TTS가 그 응답을 미리 합성했고, 결과적으로 결정적 인사말보다 먼저 발화권을 차지했다.
+
+> **발화가 시작된 시점의 Agent와 발화 처리가 끝난 시점의 Agent는 같지 않을 수 있다.**
+
+이 글은 한 건의 실제 장애를 식별 정보 없이 재구성한 Postmortem이다. 무엇이 재생됐는지가 아니라, 어떤 비동기 작업이 Agent 전환 경계를 넘어갔는지에 집중한다.
+
+> **Version note:** 사건은 2026년 6월 25일, `livekit-agents 1.6.2`와 endpointing `min_delay=0.8s`를 사용하던 환경에서 관찰됐다. 2026년 8월 8일 현재 저장소는 `livekit-agents 1.6.8`, `min_delay=0.5s`를 사용한다. 현재 코드와 당시 조건을 구분해 설명한다.
+
+## 목차
+
+- [1. 기대한 인사말 경로](#1-기대한-인사말-경로)
+- [2. 실제로 관찰한 증상](#2-실제로-관찰한-증상)
+- [3. 메트릭은 누가 문장을 만들었는지 보여줬다](#3-메트릭은-누가-문장을-만들었는지-보여줬다)
+- [4. 1초보다 짧은 시간에 Agent는 두 번 바뀌었다](#4-1초보다-짧은-시간에-agent는-두-번-바뀌었다)
+- [5. Root Cause: user turn의 소유권이 전환 중 바뀌었다](#5-root-cause-user-turn의-소유권이-전환-중-바뀌었다)
+- [6. FakeAgent의 방어가 왜 충분하지 않았을까](#6-fakeagent의-방어가-왜-충분하지-않았을까)
+- [7. 오디오 입력을 꺼도 이미 시작된 작업은 사라지지 않는다](#7-오디오-입력을-꺼도-이미-시작된-작업은-사라지지-않는다)
+- [8. 수정: 생성하면 안 되는 경계에서 생성 자체를 거부한다](#8-수정-생성하면-안-되는-경계에서-생성-자체를-거부한다)
+- [9. 회귀 테스트가 보장하는 것과 보장하지 않는 것](#9-회귀-테스트가-보장하는-것과-보장하지-않는-것)
+- [10. AMD는 판별 경계이지 대화 소유권 전체가 아니다](#10-amd는-판별-경계이지-대화-소유권-전체가-아니다)
+- [11. 비슷한 Race를 찾기 위한 관찰 방법](#11-비슷한-race를-찾기-위한-관찰-방법)
+- [12. 이 장애에서 얻은 설계 원칙](#12-이-장애에서-얻은-설계-원칙)
+
+---
+
+## 1. 기대한 인사말 경로
+
+아웃바운드 Agent는 전화를 받은 상대가 사람인지 음성사서함인지 먼저 판별한다.
+
+현재 구조에는 세 종류의 실행 주체가 연속해서 등장한다.
+
+1. `FakeAgent`: AMD가 끝날 때까지 업무 대화를 생성하지 않는 임시 Agent
+2. `SingleAgent`: 통화 전체의 업무 흐름을 소유하는 Supervisor
+3. `GreetingDtmfTask`: 설정된 인사말을 재생하고 DTMF 입력만 받는 결정적 Task
+
+정상 경로는 다음과 같다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    participant C as 수신자
+    participant A as AMD
+    participant F as FakeAgent
+    participant S as SingleAgent
+    participant G as GreetingDtmfTask
+
+    C->>A: 첫 음성
+    A->>A: human / machine 판별
+    A-->>F: human 또는 uncertain
+    F->>S: update_agent
+    S->>G: greeting Task 시작
+    G-->>C: 설정된 문장을 say()로 재생
+    C->>G: DTMF 입력
+`} />
+
+`GreetingDtmfTask`의 인사말은 LLM이 작성하는 문장이 아니다. 설정에 저장된 `message`를 그대로 `session.say()`에 전달한다.
+
+```python
+speech_handle = self.session.say(
+    greeting_text,
+    allow_interruptions=False,
+    add_to_chat_ctx=first_play,
+)
+await speech_handle.wait_for_playout()
+```
+
+이 차이는 중요하다.
+
+- `say(configured_text)`: 애플리케이션이 확정한 문장을 TTS로 읽는다.
+- LLM reply: 현재 instructions와 대화 context를 보고 모델이 새 문장을 만든다.
+
+DTMF 메뉴에서는 선택지와 표현이 업무 계약이다. 모델이 “비슷한 뜻”으로 바꾸는 것도 허용되지 않을 수 있다. 따라서 이 단계의 invariant는 단순하다.
+
+> **인사말 재생 구간에는 LLM이 만든 assistant 발화가 없어야 한다.**
+
+## 2. 실제로 관찰한 증상
+
+문제가 발생한 통화에서는 설정된 인사말이 들리지 않았다.
+
+대신 LLM이 메뉴 형태의 새 인사말을 만들었다. 설정에 설명이 비어 있던 선택지에는 모델이 임의의 의미까지 붙였다. 통화 자체는 연결됐고 TTS도 정상 동작했기 때문에, 인프라 장애나 음성 합성 실패로 보이지 않았다.
+
+영향을 과장해서는 안 된다. 이 분석으로 전체 통화 중 발생률이나 고객 영향 규모를 계산하지는 않았다. 확인된 사실은 다음과 같다.
+
+- 특정 통화에서 설정 문장과 다른 인사말이 재생됐다.
+- 해당 assistant 발화에는 LLM 실행 메트릭이 존재했다.
+- 같은 통화의 결정적 종료 문장에는 LLM 실행 메트릭이 없었다.
+- 첫 user turn의 완료 시점은 Agent 전환 이후였다.
+- 증상은 상대방이 AMD 구간 후반에 먼저 말한 경우에만 간헐적으로 나타났다.
+
+처음에는 네 가지 가설을 세울 수 있었다.
+
+| 가설 | 확인 방법 | 결과 |
+|---|---|---|
+| 설정 인사말이 잘못 저장됐다 | flow configuration과 실제 발화 비교 | 불일치했지만 설정은 정상 |
+| `SingleAgent`가 먼저 응답했다 | Agent handoff 시간과 발화 생성 시간 비교 | 생성 시점에는 다른 Task가 active |
+| TTS가 텍스트를 바꿨다 | LLM/TTS 메트릭 분리 | LLM 생성 흔적이 존재 |
+| AMD 중 발화가 뒤늦게 처리됐다 | user turn의 item 생성·EOU 시간 비교 | 전환 후 EOU 확정 |
+
+마지막 가설만 전체 타임라인을 설명했다.
+
+## 3. 메트릭은 누가 문장을 만들었는지 보여줬다
+
+Transcript만 보면 문장의 출처를 알기 어렵다. History에는 최종 발화 텍스트가 남지만, 그 문장이 설정에서 왔는지 LLM이 만들었는지는 별도 실행 흔적을 봐야 한다.
+
+이 사건에서는 같은 통화의 assistant 발화 두 개를 비교했다.
+
+| 관찰 항목 | 문제가 된 인사말 | 결정적 종료 문장 |
+|---|---:|---:|
+| LLM first-token 메트릭 | 있음 | 없음 |
+| LLM model metadata | 있음 | 없음 |
+| TTS first-byte 메트릭 | 있음 | 있음 |
+| 실행 경로 | LLM → TTS | `say()` → TTS |
+
+`say()`에 이미 완성된 문자열을 넘기는 경로는 LLM first-token 시간을 만들지 않는다. 반면 문제가 된 인사말에는 LLM 모델 정보와 first-token 시간이 모두 있었다.
+
+따라서 “설정 문장이 TTS 과정에서 변형됐다”는 가설은 기각할 수 있었다.
+
+> **결정적 음성과 생성형 음성을 구분하려면 텍스트가 아니라 생성 계보(provenance)를 기록해야 한다.**
+
+이 비교는 Postmortem의 방향을 바꿨다. 프롬프트를 찾는 대신, 어떤 Agent가 user turn을 받아 LLM을 실행했는지 추적할 수 있었다.
+
+## 4. 1초보다 짧은 시간에 Agent는 두 번 바뀌었다
+
+다음 표는 해당 통화의 상대 시간이다. `T+0`은 `AgentSession`이 시작된 시점이다. 값은 이 한 건의 event와 메트릭에서 측정한 것이며 일반적인 성능 수치가 아니다.
+
+| 상대 시간 | 사건 | active 주체 |
+|---:|---|---|
+| `T+0.000s` | Session 시작 | `FakeAgent` |
+| `T+17.999s` | AMD 판별 완료 | `FakeAgent` |
+| `T+18.005s` | `SingleAgent`를 거쳐 greeting Task 진입 | `GreetingDtmfTask` |
+| `T+18.006s` | “여보세요?” user item 생성 | `GreetingDtmfTask` |
+| `T+18.809s` | user turn EOU 확정 | `GreetingDtmfTask` |
+| `T+18.810s` | LLM 응답 생성 시작 | `GreetingDtmfTask` |
+| `T+19.409s` | 즉흥 인사말 발화 시작 | `GreetingDtmfTask` |
+
+AMD가 끝난 뒤 `SingleAgent`가 active였던 시간은 약 6밀리초뿐이었다. `SingleAgent.on_enter()`는 곧바로 현재 flow의 greeting node를 처리했고, `GreetingDtmfTask`로 제어권을 넘겼다.
+
+하지만 상대방의 “여보세요?”는 AMD가 판별을 수행하던 시간에 이미 시작된 발화였다. user item은 greeting Task 진입 직후 보였지만, turn completion은 약 0.8초 뒤에 일어났다.
+
+사건 당시 endpointing의 `min_delay`도 0.8초였다. 발화 끝을 확정하기 위해 기다리는 동안 Agent 소유권이 바뀐 것이다.
+
+<MermaidDiagram chart={`
+sequenceDiagram
+    participant C as 수신자
+    participant F as FakeAgent
+    participant S as SingleAgent
+    participant G as GreetingDtmfTask
+    participant P as Reply Pipeline
+
+    C->>F: “여보세요?” 발화 시작
+    Note over F,P: STT와 endpointing 처리 중
+    F->>S: AMD human/uncertain → update_agent
+    S->>G: greeting Task 즉시 시작
+    G->>G: 새 오디오 입력 비활성화
+    Note over F,G: 기존 user turn은 아직 in-flight
+    C-->>G: 늦은 EOU 확정
+    G->>P: 현재 Task instructions로 reply 생성
+    P-->>C: 즉흥 인사말 재생
+`} />
+
+중요한 것은 0.8초라는 숫자 자체가 아니다. 0.5초로 줄여도 event ordering이 달라지면 같은 종류의 race는 남는다.
+
+문제의 본질은 **시작된 비동기 작업이 소유자 전환과 함께 자동으로 취소되지 않았다는 것**이다.
+
+## 5. Root Cause: user turn의 소유권이 전환 중 바뀌었다
+
+Root Cause를 한 문장으로 정리하면 다음과 같다.
+
+> AMD 구간에서 시작된 user turn이 Agent 교체 후 완료됐고, 완료 시점의 `GreetingDtmfTask`가 그 turn을 자신의 대화 입력으로 처리했다.
+
+이 현상에는 여러 조건이 함께 필요했다.
+
+### 조건 A: 상대방이 AMD 판별 중 먼저 말했다
+
+짧은 “여보세요?”는 사람 응답을 판단하는 데 유용한 신호다. 동시에 STT와 turn detector가 처리할 대화 입력이기도 하다.
+
+### 조건 B: EOU가 즉시 확정되지 않았다
+
+전화에는 전송 버튼이 없다. AgentSession은 VAD, STT final과 endpointing 정보를 조합해 발화가 끝났는지 판단한다. 사건 당시 `min_delay=0.8s`였기 때문에 짧은 발화도 일정 시간 in-flight 상태로 남을 수 있었다.
+
+### 조건 C: 그사이 active Agent가 바뀌었다
+
+AMD 결과가 `human` 또는 `uncertain`이면 코드가 `SingleAgent`로 교체한다.
+
+```python
+if result.category == "human" or result.category == "uncertain":
+    call_session_data.call_answered = True
+    session.update_agent(single_agent)
+```
+
+`SingleAgent`는 greeting node를 만나면 다시 `GreetingDtmfTask`를 시작한다. 한 user turn이 끝나기 전에 두 번의 제어권 전환이 일어날 수 있었다.
+
+### 조건 D: preemptive generation이 응답을 미리 준비했다
+
+사건 당시와 현재 설정 모두 preemptive generation과 preemptive TTS를 사용한다.
+
+```python
+preemptive_generation=PreemptiveGenerationOptions(
+    enabled=True,
+    preemptive_tts=True,
+)
+```
+
+이 기능은 정상 대화에서는 첫 응답 지연을 줄인다. 하지만 생성이 허용되지 않아야 하는 Task로 지연된 turn이 넘어오면, 잘못된 문장도 빠르게 준비될 수 있다.
+
+### 조건 E: greeting Task에 생성 차단 규칙이 없었다
+
+당시 `GreetingDtmfTask`는 DTMF listener로 선택을 받았지만, 완성된 user turn이 들어왔을 때 LLM reply를 명시적으로 거부하지 않았다. Task instructions에는 메뉴 역할과 선택지가 있었기 때문에 모델은 이를 바탕으로 그럴듯한 인사말을 만들 수 있었다.
+
+각 조건은 단독으로 장애를 만들지 않는다. 이들이 특정 순서로 겹치면서 설정 인사말보다 생성형 응답이 먼저 발화권을 얻었다.
+
+## 6. FakeAgent의 방어가 왜 충분하지 않았을까
+
+사건 전날 `FakeAgent`에는 이미 `StopResponse` 방어가 추가돼 있었다.
+
+```python
+class FakeAgent(Agent):
+
+    async def on_user_turn_completed(self, turn_ctx, new_message):
+        raise StopResponse()
+```
+
+의도는 정확했다. AMD 중 상대방이 먼저 말하더라도 임시 Agent가 답하지 못하게 막는 것이다.
+
+그런데도 다음 날 문제가 재현됐다.
+
+이유는 guard가 잘못돼서가 아니라 **guard가 실행될 시점에 `FakeAgent`가 더 이상 active가 아니었기 때문**이다.
+
+`on_user_turn_completed()`는 발화가 시작될 때가 아니라 turn이 완료된 뒤 호출된다. 이번 사건에서는 EOU가 확정될 때 이미 `GreetingDtmfTask`가 active였다. `FakeAgent`의 메서드는 호출될 기회가 없었다.
+
+```text
+발화 시작                  EOU 확정
+   │                         │
+   ▼                         ▼
+FakeAgent ──→ SingleAgent ──→ GreetingDtmfTask
+   guard 있음                  당시 guard 없음
+```
+
+이것은 component-local guard의 한계를 보여준다.
+
+생성 금지 규칙을 “이 입력이 시작된 컴포넌트”에만 두면, 비동기 입력이 다른 컴포넌트에서 완료될 때 규칙이 사라진다. 반대로 “생성하면 안 되는 모든 consumer”가 직접 거부하면 입력의 출발점과 무관하게 invariant를 지킬 수 있다.
+
+## 7. 오디오 입력을 꺼도 이미 시작된 작업은 사라지지 않는다
+
+`GreetingDtmfTask.on_enter()`는 진입하자마자 오디오 입력을 비활성화한다.
+
+```python
+self.session.input.set_audio_enabled(False)
+```
+
+그래서 처음에는 “greeting Task에서 어떻게 user turn이 처리됐을까?”라는 의문이 생겼다.
+
+답은 ingress와 in-flight work의 차이에 있다.
+
+- 입력 비활성화: 이후 들어오는 새 오디오를 막는다.
+- pending turn 취소: 이미 받은 audio frame, STT 결과와 EOU 작업을 폐기한다.
+- preemptive draft 취소: 이미 생성 또는 합성 중인 assistant 응답을 버린다.
+
+이 세 동작은 같지 않다.
+
+문을 닫는다고 이미 건물 안에 들어온 작업이 사라지지는 않는다. 사건의 “여보세요?”는 오디오 입력을 끄기 전에 session pipeline에 들어왔다. 이후 입력을 막아도 STT final, endpointing과 reply pipeline은 계속 진행할 수 있었다.
+
+비슷한 오해는 여러 비동기 시스템에서 나타난다.
+
+| 겉으로 한 조치 | 자동으로 보장되지 않는 것 |
+|---|---|
+| socket read 중지 | 이미 queue에 들어간 message 삭제 |
+| HTTP 요청 cancel | 외부 시스템의 side effect rollback |
+| event listener 제거 | 이미 scheduling된 callback 취소 |
+| 오디오 입력 비활성화 | 이미 시작된 turn과 draft 폐기 |
+
+따라서 Agent handoff에는 “새 입력을 누가 받는가?”뿐 아니라 “이전 주체가 시작한 미완료 작업을 누가 처리하거나 폐기하는가?”라는 계약이 필요하다.
+
+## 8. 수정: 생성하면 안 되는 경계에서 생성 자체를 거부한다
+
+직접 수정은 작았다.
+
+`GreetingDtmfTask`에도 `on_user_turn_completed()`를 추가하고 모든 LLM 자유응답을 `StopResponse`로 거부했다.
+
+```python
+async def on_user_turn_completed(
+    self,
+    turn_ctx: ChatContext,
+    new_message: ChatMessage,
+) -> None:
+    logger.bind(
+        event="GREETING_DTMF_STOP_RESPONSE",
+        user_text=new_message.text_content,
+    ).debug("Suppressing LLM reply during greeting DTMF task")
+    raise StopResponse()
+```
+
+이 위치가 중요한 이유는 greeting Task가 **최종 consumer**이기 때문이다.
+
+발화가 `FakeAgent`에서 시작됐든, `SingleAgent`에서 시작됐든, Task 진입 직전에 시작됐든 상관없다. turn completion 시점의 active 주체가 `GreetingDtmfTask`라면 생성은 거부된다.
+
+함께 적용한 경계는 다음과 같다.
+
+### 결정적 인사말은 음성 끼어들기로 중단하지 않는다
+
+```python
+self.session.say(
+    greeting_text,
+    allow_interruptions=False,
+)
+```
+
+AMD 구간에서 버퍼된 짧은 음성이 인사말을 중단시키고 timeout 경로로 이어지는 것을 막는다.
+
+### DTMF는 강제로 인사말을 중단할 수 있다
+
+```python
+self.session.interrupt(force=True)
+```
+
+음성 입력은 막지만 유효한 DTMF 선택은 별도 RTC listener가 처리한다. 따라서 “음성에는 비중단, DTMF에는 즉시 중단”이라는 입력 정책을 코드로 분리했다.
+
+### 임시 Agent도 계속 생성하지 않는다
+
+`FakeAgent`의 `StopResponse`도 유지한다. 이 guard는 EOU가 AMD 구간 안에서 끝나는 일반 경로를 막고, greeting Task의 guard는 전환 뒤로 넘어온 경로를 막는다.
+
+<MermaidDiagram chart={`
+flowchart LR
+    U[첫 user audio] --> E{EOU 완료 시점}
+    E -->|AMD 중| F[FakeAgent]
+    E -->|handoff 뒤| G[GreetingDtmfTask]
+    F -->|StopResponse| X[LLM reply 없음]
+    G -->|StopResponse| X
+    G --> D[설정 문장 say]
+`} />
+
+endpointing 지연을 줄이는 것은 체감 속도에 도움이 될 수 있지만 이 문제의 핵심 수정은 아니다. timing 값을 바꾸면 race window가 좁아질 뿐, 금지된 생성이 구조적으로 불가능해지지는 않는다.
+
+## 9. 회귀 테스트가 보장하는 것과 보장하지 않는 것
+
+수정과 함께 `GreetingDtmfTask`가 어떤 user turn에도 LLM reply를 만들지 않는다는 테스트를 추가했다.
+
+```python
+async def test_suppresses_llm_reply_on_user_turn(self):
+    task = GreetingDtmfTask(
+        message="안녕하세요 ...",
+        dtmf_options={"1": "예약 신청", "2": "상담원 연결"},
+    )
+    user_message = ChatMessage(role="user", content=["여보세요?"])
+
+    with self.assertRaises(StopResponse):
+        await task.on_user_turn_completed(
+            ChatContext.empty(),
+            user_message,
+        )
+```
+
+2026년 8월 8일 현재 다음 명령으로 해당 테스트 파일을 실행했고 두 테스트가 통과했다.
+
+```bash
+PYTHONPATH=src .venv/bin/python \
+  -m unittest tests.test_greeting_dtmf_task -v
+```
+
+이 테스트가 보장하는 것은 명확하다.
+
+- greeting Task에 user turn이 전달돼도 LLM 응답을 생성하지 않는다.
+- 구현이 `StopResponse` invariant를 제거하면 회귀를 발견한다.
+
+반대로 다음 전체 시간선까지 재현하지는 않는다.
+
+- AMD 판별 중 음성 입력
+- `FakeAgent`에서 `SingleAgent`로 전환
+- greeting Task 진입
+- 전환 후 EOU 확정
+- preemptive draft의 생성·폐기
+
+즉 현재 테스트는 **최종 방어선의 단위 테스트**다. 전체 race를 검증하려면 controllable clock과 가짜 STT/turn event를 사용한 session-level 테스트가 추가로 필요하다.
+
+추천하는 회귀 매트릭스는 다음과 같다.
+
+| 시나리오 | 기대 결과 |
+|---|---|
+| AMD 중 발화, AMD 중 EOU | `FakeAgent`가 reply 차단 |
+| AMD 중 발화, handoff 뒤 EOU | greeting Task가 reply 차단 |
+| 인사말 중 음성 입력 | 설정 인사말 계속 재생 |
+| 인사말 중 유효 DTMF | 인사말 중단 후 선택 처리 |
+| 인사말 중 무효 DTMF | 설정된 retry 또는 종료 정책 실행 |
+| machine 판별 | 업무 Agent 활성화 없이 종료 |
+
+## 10. AMD는 판별 경계이지 대화 소유권 전체가 아니다
+
+LiveKit의 현재 AMD는 통화 시작 시 첫 발화를 듣고 다음 다섯 범주 중 하나로 분류한다.
+
+- `human`
+- `machine-ivr`
+- `machine-vm`
+- `machine-unavailable`
+- `uncertain`
+
+공식 문서에 따르면 AMD가 실행되는 동안 Agent speech는 pause되고, 판별이 끝나면 결과에 따라 대화·음성사서함·IVR·종료 경로를 선택한다. 짧은 인사와 침묵을 이용한 fast path와 transcript를 해석하는 LLM 경로가 함께 사용된다.
+
+현재 outbound 구현은 `gpt-4.1`을 classifier로 지정하고 `ivr_detection=False`, `no_speech_threshold=3.0`을 사용한다. 결과가 `human` 또는 `uncertain`이면 `SingleAgent`를 활성화하고, 그 밖의 결과는 음성사서함 경로로 종료한다.
+
+```python
+async with AMD(
+    session,
+    llm=openai.LLM(model="gpt-4.1", temperature=0),
+    ivr_detection=False,
+    detection_options=DetectionOptions(
+        no_speech_threshold=3.0,
+    ),
+) as detector:
+    result = await detector.execute()
+```
+
+여기에서 구분해야 할 책임이 있다.
+
+- AMD: 첫 음성을 듣고 응답 유형을 판별하며 Agent speech 권한을 제어한다.
+- AgentSession: STT, endpointing, user turn과 reply pipeline을 관리한다.
+- 애플리케이션: 판별 결과 뒤 어떤 Agent·Task를 활성화할지 결정한다.
+- 각 Task: 자신의 구간에서 허용되는 입력과 생성 행동을 제한한다.
+
+AMD를 사용한다고 Agent handoff의 모든 pending work가 자동으로 정리된다고 가정하면 안 된다. 공식 기능이 speech를 pause해도, 애플리케이션이 판별 직후 여러 Agent와 Task를 교체하는 방식은 자체 전환 invariant가 필요하다.
+
+또한 LiveKit AMD는 빠르게 변하는 기능이다. 사건 당시 프로젝트 버전은 1.6.2였고 현재는 1.6.8이다. 새 버전으로 올릴 때는 category, timer, turn consumption과 authorization 동작을 현재 문서와 release code에서 다시 확인해야 한다.
+
+## 11. 비슷한 Race를 찾기 위한 관찰 방법
+
+이 장애는 error log 하나로 드러나지 않았다. 시스템 관점에서는 LLM도 성공했고 TTS도 성공했다. 잘못된 주체가 성공적으로 문장을 만든 것이 문제였다.
+
+따라서 관찰 항목은 성공 여부보다 **순서와 출처**를 보여줘야 한다.
+
+### 1) Agent와 Task 전환 시간을 기록한다
+
+최소한 다음 전환을 같은 monotonic timeline에서 비교할 수 있어야 한다.
+
+```text
+FakeAgent entered
+AMD result emitted
+SingleAgent entered
+GreetingDtmfTask entered
+User item created
+User EOU committed
+LLM generation started
+TTS playout started
+```
+
+wall-clock 문자열만 모으면 process 간 clock skew와 로그 지연 때문에 순서를 잘못 해석할 수 있다. 같은 session에서 상대 시간이나 monotonic timestamp를 함께 기록하는 편이 안전하다.
+
+### 2) assistant 발화의 생성 출처를 남긴다
+
+모든 발화에 다음 정보를 연결하면 결정적 경로 위반을 찾기 쉬워진다.
+
+- `source=scripted_say | llm_reply | tool_result`
+- active Agent와 Task 이름
+- LLM model과 generation ID
+- TTS speech handle ID
+- user turn ID
+
+greeting phase에서 `source=llm_reply`가 나타나면 내용이 자연스러워도 invariant 위반이다.
+
+### 3) 입력 상태와 pending work를 별도로 본다
+
+`audio_enabled=false`만 기록하면 이미 진행 중인 STT, EOU와 draft가 있는지 알 수 없다. handoff 시점에 다음 값이 유용하다.
+
+- pending user turn 존재 여부
+- current speech와 preemptive draft 존재 여부
+- input enabled 상태
+- current Agent/Task generation
+- turn을 시작한 Agent와 완료한 Agent
+
+### 4) 식별 정보 없이도 디버깅 가능한 event를 만든다
+
+원본 전화번호, 수신자 이름과 transcript 전체를 구조화 로그에 반복 저장할 필요는 없다. session-scoped ID, 상대 시간, category와 source만으로도 race의 대부분을 재구성할 수 있다. 음성 내용이 필요하면 접근 통제된 원본과 분리해 보관해야 한다.
+
+현재 코드의 `AMD_RESULT`와 `GREETING_DTMF_STOP_RESPONSE`는 좋은 시작점이다. 여기에 turn ID와 handoff generation을 연결하면 “어느 단계에서 차단됐는가?”까지 확인할 수 있다.
+
+## 12. 이 장애에서 얻은 설계 원칙
+
+### 1) 비동기 작업의 생명은 소유자보다 길 수 있다
+
+Agent를 교체해도 이전 Agent에서 시작된 STT, endpointing, tool call과 생성 task가 자동으로 사라진다고 가정하지 않는다.
+
+### 2) 생성 금지는 최종 consumer에서도 강제한다
+
+입력 시작점에만 guard를 두지 않는다. 결정적 Task처럼 LLM 생성이 절대 필요 없는 consumer가 직접 `StopResponse`를 반환해야 한다.
+
+### 3) 입력 차단과 pending work 취소를 분리한다
+
+새 오디오를 막는 것, 기존 turn을 폐기하는 것, preemptive draft를 취소하는 것은 서로 다른 제어다.
+
+### 4) timing 조정으로 correctness를 증명하지 않는다
+
+endpointing delay를 줄이면 재현 빈도가 낮아질 수 있지만 event ordering invariant는 만들지 못한다. timing은 성능 설정이고 guard는 정확성 경계다.
+
+### 5) 결정적 구간에는 생성 provenance를 검증한다
+
+설정 문장을 읽는 단계에서 LLM metric이 나타나면 성공한 호출이라도 오류다. 내용 비교보다 실행 경로 검증이 더 안정적이다.
+
+### 6) state가 아니라 transition을 테스트한다
+
+각 Agent가 따로 잘 동작하는지만 확인하지 않는다. 발화가 시작된 뒤 Agent가 바뀌고, EOU가 나중에 도착하는 순서를 테스트해야 한다.
+
+### 7) 보수적인 분류와 보수적인 발화는 다른 문제다
+
+`uncertain`을 사람으로 처리해 대화를 이어가는 정책은 합리적일 수 있다. 그렇다고 판별 중 생성된 어떤 draft든 발화해도 된다는 뜻은 아니다.
+
+## 마치며
+
+이 장애에서 LLM은 실패하지 않았다.
+
+주어진 instructions를 읽고 그럴듯한 메뉴 인사말을 만들었다. STT도 첫 발화를 인식했고 endpointing도 설정된 지연 뒤 turn을 완료했다. TTS도 만들어진 문장을 정상적으로 재생했다.
+
+각 컴포넌트는 자기 역할을 수행했다. 문제는 그 역할들이 만나는 시간 경계였다.
+
+AMD 중 시작된 “여보세요?”는 `FakeAgent`가 사라진 뒤에도 살아 있었다. turn이 완료됐을 때는 `GreetingDtmfTask`가 active였고, 당시 그 Task에는 생성 거부 규칙이 없었다. preemptive generation은 잘못된 경로를 더 빠르게 실행했다.
+
+해결은 더 강한 프롬프트가 아니었다. 생성하면 안 되는 Task가 생성 요청 자체를 거부하도록 만드는 것이었다.
+
+> **실시간 Agent 시스템에서 handoff는 현재 객체를 바꾸는 일이 아니라, 이미 시작된 작업의 소유권을 정리하는 일이다.**
+
+첫 발화처럼 짧은 event도 여러 상태 경계를 통과할 수 있다. 그래서 좋은 방어선은 “여기까지는 문제가 오지 않을 것”이라는 기대가 아니라, 문제가 도착해도 다음 행동을 허용하지 않는 코드에 있어야 한다.
+
+---
+
+## 참고 자료
+
+- [LiveKit Documentation: Answering machine detection](https://docs.livekit.io/telephony/features/answering-machine-detection/)
+- [LiveKit Blog: Detect voicemail and IVR with outbound phone agents (May 13, 2026)](https://livekit.com/blog/answering-machine-detection)
+- [LiveKit Blog: Configuring Turn Detection and Interruptions in LiveKit Agents (June 30, 2026)](https://livekit.com/blog/turn-detection-and-interruption-handling)
+- [LiveKit Agents Python API](https://docs.livekit.io/reference/python/livekit/agents/index.html)
