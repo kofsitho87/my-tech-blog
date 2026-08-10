@@ -7,7 +7,7 @@ import GoogleTagManagerNoscript from '../../components/GoogleTagManagerNoscript.
 import Header from '../../components/Header.astro';
 import { SITE_DESCRIPTION, SITE_TITLE, pathWithBase } from '../../consts';
 
-const posts = (await getCollection('blog')).sort((a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf());
+const posts = (await getCollection('blog', ({ data }) => !data.draft)).sort((a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf());
 ---
 <!doctype html>
 <html lang="ko">

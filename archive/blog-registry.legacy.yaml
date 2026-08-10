@@ -1,0 +1,174 @@
+version: 1
+last_updated: "2026-08-08"
+status_source: "2026-08-07 사용자 제공 배포 목록 및 GitHub Pages 배포 검증"
+articles:
+  - id: "config-driven-voice-agent"
+    title: "IVR을 넘어: 설정 기반 Voice AI Agent 설계하기"
+    created_at: "2026-04-21 11:30:57"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/config-driven-voice-ai-beyond-ivr/"
+      en:
+        status: "published"
+        url: null
+  - id: "livekit-hospital-voice-ai"
+    title: "전화받는 AI는 어떻게 만들어질까?"
+    created_at: "2026-05-05 18:52:10"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/livekit-agents-hospital-inbound-voice-ai/"
+      en:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/how-we-built-ai-that-answers-hospital-phone-calls/"
+  - id: "livekit-warm-transfer"
+    title: "AI에서 사람으로 안전하게 연결하기"
+    created_at: "2026-05-13 21:29:23"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/self-hosted-livekit-single-room-warm-transfer/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "wise-ai-never-miss-call"
+    title: "병원이 바쁜 순간에도 환자의 전화는 멈추지 않습니다"
+    created_at: "2026-05-21 07:57:50"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/wise-ai-inbound-agent-never-miss-a-patient-call/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-turn-detection"
+    title: "AI는 환자가 말을 끝낸 순간을 어떻게 알까?"
+    created_at: "2026-05-29 08:21:56"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-turn-detection-and-interruption/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-latency"
+    title: "AI 전화 상담원이 대답하기까지"
+    created_at: "2026-06-06 08:51:33"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-stt-llm-tts-latency/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-post-call-analysis"
+    title: "통화 종료가 데이터의 시작이다"
+    created_at: "2026-06-14 10:01:17"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-post-call-analysis-pipeline/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-grounding-rag"
+    title: "AI가 병원 정보를 지어내지 않게 하려면"
+    created_at: "2026-06-22 10:40:58"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-grounding-rag-hospital-knowledge/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-testing"
+    title: "출시 전에 AI 상담원을 어떻게 테스트할까"
+    created_at: "2026-06-30 11:29:52"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/how-to-test-voice-ai-before-launch/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-resilience"
+    title: "Voice AI는 장애가 나도 통화를 이어가야 한다"
+    created_at: "2026-07-08 14:26:22"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-resilience-and-failure-recovery/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-safe-appointment-intake"
+    title: "AI가 실제 예약 요청을 접수하기까지"
+    created_at: "2026-07-15 15:08:26"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-safe-appointment-intake/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-safe-tool-calling"
+    title: "AI는 언제 도구를 사용하고, 언제 말로 답해야 할까?"
+    created_at: "2026-07-21 15:25:10"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-safe-tool-calling/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-concurrent-call-scaling"
+    title: "전화가 동시에 몰리면 AI 상담원은 어떻게 버틸까?"
+    created_at: "2026-07-27 15:41:33"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-concurrent-call-scaling/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-supervisor-agent-tasks"
+    title: "AI 상담원은 왜 하나인데, 업무는 여러 Task로 나눌까?"
+    created_at: "2026-07-31 15:59:41"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-supervisor-agent-tasks/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-async-tools-reservation-lookup"
+    title: "예약 조회가 느릴 때 AI는 무엇을 말해야 할까?"
+    created_at: "2026-08-04 16:33:18"
+    languages:
+      ko:
+        status: "published"
+        url: "https://kofsitho87.github.io/my-tech-blog/blog/voice-ai-async-tools-reservation-lookup/"
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-outbound-callee-lifecycle"
+    title: "전화가 연결되기 전에 Agent는 무엇을 기다려야 할까?"
+    created_at: "2026-08-07 23:18:17"
+    languages:
+      ko:
+        status: "unpublished"
+        url: null
+      en:
+        status: "not_applicable"
+        url: null
+  - id: "voice-ai-amd-agent-handoff-race"
+    title: "AI가 설정된 인사말 대신 마음대로 말한 이유"
+    created_at: "2026-08-08 00:32:02"
+    languages:
+      ko:
+        status: "unpublished"
+        url: null
+      en:
+        status: "not_applicable"
+        url: null

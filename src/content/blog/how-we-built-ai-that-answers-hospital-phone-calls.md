@@ -3,7 +3,11 @@ title: 'How We Built an AI That Answers Hospital Phone Calls'
 description: 'A practical look at LiveKit, SIP, STT–LLM–TTS, tool calling, and the real-time engineering problems that exist beyond the language model.'
 pubDate: '2026-05-06'
 heroImage: '../../assets/blog/livekit-hospital-voice-ai-hero.png'
+articleId: 'livekit-hospital-voice-ai'
 lang: 'en'
+draft: false
+sourceRepo: 'inbound'
+topics: ['product-overview', 'agent-architecture']
 ---
 
 A patient finishes speaking.

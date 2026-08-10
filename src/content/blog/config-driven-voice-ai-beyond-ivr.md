@@ -2,6 +2,12 @@
 title: 'IVR을 넘어: 설정 기반 Voice AI Agent 설계하기'
 description: '결정론적인 콜 플로우와 LLM 에이전트를 결합해 운영 가능한 음성 AI 시스템을 만든 방법'
 pubDate: '2026-04-21'
+heroImage: '../../assets/blog/beyond-ivr-voice-agent-hero.png'
+articleId: 'config-driven-voice-agent'
+lang: 'ko'
+draft: false
+sourceRepo: 'inbound'
+topics: ['agent-architecture', 'telephony-sip']
 ---
 
 병원과 의원의 전화는 단순하지 않다. 예약, 변경, 취소, 진료 시간 문의, 길 안내, 보험 관련 질문처럼 서로 다른 목적의 통화가 끊임없이 들어온다. 전통적인 IVR은 이런 요청을 안정적으로 분기하지만 유연하지 않고, 순수 LLM 음성 에이전트는 자연스럽지만 운영자가 원하는 흐름을 항상 보장하기 어렵다.
