@@ -1,0 +1,4 @@
+interface:
+  display_name: "Blog Topics"
+  short_description: "Find evidence-backed gaps in blog coverage"
+  default_prompt: "Use $blog-topics to analyze my blog coverage and recommend evidence-backed topics to write next."
