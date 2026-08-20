@@ -1,0 +1,435 @@
+---
+title: 'LLM 평가 결과를 운영 지표로 믿으려면: Voice AI의 Privacy-safe Langfuse 평가 설계'
+description: '통화 transcript를 외부로 보내지 않고도 업무 완료, 라우팅 정확성, 응답 품질을 Langfuse 세션 점수로 만드는 증거·개인정보·재처리 경계를 설명합니다.'
+pubDate: '2026-08-20'
+heroImage: '../../assets/blog/voice-ai-privacy-safe-langfuse-evaluation-hero.png'
+articleId: 'voice-ai-privacy-safe-langfuse-evaluation'
+lang: 'ko'
+draft: true
+sourceRepo: 'inbound'
+topics: ['call-analysis', 'observability', 'testing-eval']
+---
+
+import MermaidDiagram from '../../components/MermaidDiagram.astro';
+
+## 1. 통화에 점수 하나를 붙이는 일은 왜 어려울까
+
+환자가 병원에 전화해 진료 예약을 요청한다. AI는 가능한 일정을 찾지 못해 상담원에게 연결하고, 상담원이 전화를 받아 후속 처리를 이어간다.
+
+이 통화는 성공했을까?
+
+- AI가 예약을 직접 접수하지 못했으니 실패라고 볼 수 있다.
+- 환자가 사람에게 안전하게 연결됐으니 부분적으로 성공했다고 볼 수 있다.
+- 환자가 처음부터 상담원 연결을 요청했다면 완전한 성공이다.
+- 연결 과정은 맞았어도 AI가 근거 없는 정보를 말했다면 좋은 통화라고 할 수 없다.
+
+`성공률`이라는 숫자 하나만 먼저 정하면 이 차이를 잃는다. 반대로 transcript 전체를 LLM에게 넘겨 매번 종합 점수를 만들면, 같은 통화가 재처리될 때 결과가 달라질 수 있고 민감한 대화가 관측 시스템으로 퍼질 수 있다.
+
+우리가 풀고 싶었던 문제는 단순히 Langfuse에 점수를 전송하는 일이 아니었다.
+
+> 통화의 서로 다른 품질 축을 어떤 증거로 계산하고, 무엇을 외부로 보내지 않으며, 재처리해도 같은 점수를 어떻게 다시 찾을 것인가?
+
+이를 위해 통화 평가를 세 점수로 분리했다.
+
+1. `task_completion` — 시스템 이벤트가 증명하는 업무 완료 정도
+2. `routing_correctness` — 환자가 요청한 경로와 실제 실행 경로의 일치 여부
+3. `response_quality` — 근거성·관련성·명료성·대화 처리·말투를 합친 응답 품질
+
+세 점수는 같은 통화를 설명하지만 같은 데이터에서 나오지 않는다. 이 차이가 설계의 출발점이다.
+
+---
+
+## 2. 먼저 사실과 해석을 분리한다
+
+통화 후 분석에는 두 종류의 증거가 있다.
+
+### 결정론적 이벤트
+
+예약 조회, 예약 신청, 상담원 연결과 메모 접수는 구조화된 이벤트를 남긴다. 이벤트를 시간순으로 묶으면 어떤 업무를 시도했고 어느 단계에서 어떻게 끝났는지 재현할 수 있다.
+
+~~~text
+BOOKING_CREATE: STARTED
+BOOKING_CREATE: FAILED
+WARM_TRANSFER_CALL: STARTED
+WARM_TRANSFER_CALL: SUCCESS
+~~~
+
+이 기록은 예약 신청이 직접 완료되지 않았고 상담원 연결이 성공했다는 사실을 알려준다. LLM이 문장을 해석하지 않아도 같은 입력에서 같은 결과를 계산할 수 있다.
+
+### 의미 분석
+
+반면 환자가 무엇을 원했는지, AI 답변이 질문과 관련 있었는지, 근거 없는 성공을 주장했는지는 대화의 의미를 읽어야 알 수 있다.
+
+~~~text
+환자: 오늘 가능한 시간이 있나요?
+AI: 예약을 원하시는 건가요?
+환자: 네, 가장 빠른 시간으로 예약하고 싶어요.
+~~~
+
+첫 문장만 보면 정보 문의처럼 보이지만, 이어진 맥락에서는 예약 신청 조건을 좁히는 대화다. 이 판단은 구조화 이벤트만으로 만들기 어렵다.
+
+<MermaidDiagram chart={`flowchart LR
+    CALL["통화 원본"] --> EVENTS["구조화 이벤트"]
+    CALL --> TURNS["대화 Turn"]
+    EVENTS --> ANALYTICS["결정론 Analytics"]
+    TURNS --> SEMANTIC["LLM Semantic"]
+    ANALYTICS --> TASK["Task Completion"]
+    ANALYTICS --> ROUTE["실제 실행 경로"]
+    SEMANTIC --> EXPECTED["요청 경로 · 응답 Rubric"]
+    EXPECTED --> ROUTING["Routing Correctness"]
+    ROUTE --> ROUTING
+    EXPECTED --> QUALITY["Response Quality"]`} />
+
+중요한 경계가 하나 있다. Semantic 계층은 결정론적 실패 귀인을 다시 쓰지 않는다. LLM이 “환자가 불편해 보였다”고 판단했다고 해서 이벤트가 증명한 API 실패를 환자 이탈로 바꾸면 분석의 재현성이 무너진다.
+
+LLM은 이벤트가 표현하지 못하는 의미를 보완하고, 두 증거를 비교하는 평가는 별도 계층이 맡는다.
+
+---
+
+## 3. 점수보다 먼저 판단 가능한 범위를 저장한다
+
+모든 통화가 평가 가능한 것은 아니다.
+
+- 환자 발화가 전혀 없을 수 있다.
+- 상담원 연결 이후 transcript가 누락될 수 있다.
+- 응답 품질을 판단하기에 대화가 너무 짧을 수 있다.
+- LLM 판단 confidence가 운영 임계값보다 낮을 수 있다.
+
+평가할 수 없는 통화에 억지로 0점을 주면 `평가 불가`가 `품질 불량`으로 바뀐다. 그래서 Semantic 결과에는 점수뿐 아니라 판단 범위를 함께 저장한다.
+
+| 필드 | 의미 |
+|---|---|
+| `transcript_scope` | AI 구간만 있는지, 상담원 구간까지 있는지, 일부만 있는지 |
+| `limitations` | 상담원 transcript 누락, 환자 발화 없음 같은 제약 |
+| `analysis_status` | 분석 완료인지, 비용 없이 건너뛴 통화인지 |
+| `confidence` | 해당 판단을 운영 지표에 사용할 수 있는지 |
+| `evidence_turn_indices` | 판단이 실제 어느 turn을 근거로 했는지 |
+
+예를 들어 상담원 연결 성공 이벤트는 있어도 상담원 transcript가 없다면 “연결됨”은 확정할 수 있지만 “상담으로 문제가 해결됨”은 알 수 없다. 이 경우 상담 결과는 `unknown`으로 남겨야 한다.
+
+`unknown`은 데이터 부족을 솔직하게 표현하는 값이다. 0점으로 바꾸는 순간 데이터 부족과 실제 실패를 구분할 수 없게 된다.
+
+---
+
+## 4. 첫 번째 점수: 업무 완료는 이벤트로 계산한다
+
+`task_completion`은 LLM을 사용하지 않는다. Analytics가 복원한 `IntentAttempt`와 outcome만 읽는다.
+
+우리 시스템에서는 업무 결과를 세 단계로 해석한다.
+
+| 결과 | 점수 | 의미 |
+|---|---:|---|
+| AI가 업무를 직접 완료 | `1.0` | 예약 조회·신청 같은 원래 업무가 완료됨 |
+| 원래 업무는 못 했지만 상담원 연결·메모 fallback 완료 | `0.5` | 환자 요청이 다음 처리 경로로 안전하게 넘어감 |
+| 업무와 fallback 모두 미완료 | `0.0` | 요청을 처리할 다음 경로가 확보되지 않음 |
+
+여기서 상담원 연결은 항상 0.5가 아니다.
+
+- 환자가 예약을 요청했지만 예약에 실패한 뒤 상담원에게 연결됐다면 예약 업무 기준 0.5다.
+- 환자가 처음부터 “상담원 연결해 주세요”라고 요청했고 실제 연결됐다면 그 업무는 1.0이다.
+
+같은 transfer 성공도 `원래 요청`이 무엇이었는지에 따라 의미가 달라진다.
+
+~~~python
+def business_task_value(intent, attempts):
+    if fulfilled(intent, attempts):
+        return 1.0
+    if completed_transfer(intent, attempts) or completed_memo(intent, attempts):
+        return 0.5
+    return 0.0
+~~~
+
+한 통화에서 여러 업무를 시도했다면 서로 다른 intent의 점수를 평균한다. 예약 조회는 성공했지만 예약 취소는 실패했다면 결과는 0.5다. 같은 예약 조회를 여러 번 시도했다고 분모를 계속 늘리지는 않는다. 우리는 통화에서 식별된 고유 업무 종류를 기준으로 계산한다.
+
+반대로 업무 시도 자체를 찾지 못한 통화에는 점수를 만들지 않는다. 무응답 통화에 0점을 붙이면 AI가 실패한 통화처럼 보이기 때문이다.
+
+이 점수의 장점은 설명 가능성이다. Langfuse에 남는 값이 0.5라면 metadata의 intent별 결과와 최종 resolution을 통해 계산 이유를 다시 확인할 수 있다.
+
+---
+
+## 5. 두 번째 점수: 라우팅은 의미와 실행을 비교한다
+
+`routing_correctness`은 한 종류의 증거만으로 만들 수 없다.
+
+- 기대 경로: transcript에서 Semantic 계층이 추출한 `requested_intents`
+- 실제 경로: 이벤트에서 Analytics가 복원한 `IntentAttempt`
+
+예를 들어 환자가 예약 신청을 요청했는데 시스템이 예약 취소 Tool을 실행했다면 라우팅 오류다.
+
+~~~text
+expected = [booking_create]
+actual   = [booking_cancel]
+result   = false
+~~~
+
+하지만 예약 신청을 시도한 뒤 실패해 상담원 연결로 넘어간 것은 잘못된 라우팅이 아니다.
+
+~~~text
+expected = [booking_create]
+actual   = [booking_create, transfer]
+result   = true
+~~~
+
+원래 업무 경로가 맞았다면 이후의 fallback transfer나 메모는 허용한다. 반면 환자가 직접 상담원 연결도 요청했다면 실제 경로에도 transfer가 있어야 한다.
+
+### confidence 아래의 판단은 사용하지 않는다
+
+Semantic 계층이 추출한 모든 intent를 곧바로 기대 경로로 쓰지 않는다. 설정된 confidence threshold를 넘은 finding만 비교한다. 기준을 넘는 요청이 하나도 없다면 false가 아니라 `점수 없음`이다.
+
+이 구분이 중요한 이유는 Boolean 점수의 0이 강한 주장이라는 데 있다.
+
+> 0은 “잘못 라우팅했다”는 뜻이지 “무슨 요청인지 확신하지 못했다”는 뜻이 아니다.
+
+### 프롬프트 경계도 회귀 테스트가 필요하다
+
+“오늘 예약 가능해요?”는 독립된 질문이면 정보 문의일 수 있다. 그러나 “예약해 주세요” 이후 이어진 날짜·시간 질문이라면 예약 신청을 구체화하는 turn이다.
+
+이 경계를 잘못 분류하면 실제 실행은 맞았는데 `routing_correctness=0`이 된다. 그래서 의미 분류 프롬프트도 일반 설명문이 아니라 운영 지표의 일부로 보고, 일정 질문과 예약 의도 전환을 회귀 테스트로 고정한다.
+
+---
+
+## 6. 세 번째 점수: 응답 품질은 평균만으로 끝나지 않는다
+
+`response_quality`은 다섯 차원을 1점에서 5점으로 평가한다.
+
+| 차원 | 가중치 | 질문 |
+|---|---:|---|
+| Groundedness | 0.35 | 답변이 제공된 병원 정보와 실제 업무 결과에 근거하는가 |
+| Relevance | 0.20 | 환자의 현재 요청에 직접 답했는가 |
+| Clarity | 0.15 | 음성으로 듣기 명확하고 불필요하게 복잡하지 않은가 |
+| Conversation handling | 0.15 | 되묻기·조건 변경·종료 흐름을 자연스럽게 처리했는가 |
+| Tone | 0.15 | 병원 전화 안내에 맞는 침착하고 적절한 말투인가 |
+
+각 평점은 0에서 1로 정규화한 뒤 가중 합산한다.
+
+~~~text
+normalized = (rating - 1) / 4
+quality = Σ(normalized_dimension × weight)
+~~~
+
+Groundedness의 비중이 가장 큰 이유는 자연스럽지만 틀린 병원 안내가 어색하지만 안전한 답변보다 위험하기 때문이다.
+
+### 치명적 실패는 평균으로 상쇄할 수 없다
+
+다섯 차원의 평균만 사용하면 심각한 문제가 가려질 수 있다. 예를 들어 말투와 명료성이 모두 좋아도 환자의 동의 없이 예약 요청을 기록했다면 높은 점수를 받아서는 안 된다.
+
+그래서 critical failure가 최종 점수에 우선한다.
+
+| Critical failure | 처리 |
+|---|---|
+| 근거 없는 성공 주장 | 최대 0.2 |
+| 조작된 병원 정보 | 최대 0.2 |
+| 동의 위반 | 0.0 |
+| 안전·개인정보 위반 | 0.0 |
+
+이것은 “안전이 중요하다”는 문구가 아니라 점수 함수에 들어간 정책이다. 좋은 평균이 치명적 실패를 희석하지 못하게 한다.
+
+또한 다섯 평점 중 하나라도 없거나 confidence가 기준보다 낮으면 점수를 만들지 않는다. 부분 데이터로 완전한 품질 점수처럼 보이는 숫자를 만드는 것보다 비워 두는 편이 낫다.
+
+---
+
+## 7. Langfuse에는 통화가 아니라 비민감 집계값을 보낸다
+
+Langfuse는 Score를 trace, observation, session이나 dataset run에 연결할 수 있다. 우리는 전화 한 통 전체를 평가하므로 `room_name`을 `session_id`로 사용해 세 점수를 같은 통화에 묶는다.
+
+공식 문서도 여러 interaction으로 이루어진 전체 대화를 평가할 때 session-level score를 사용할 수 있다고 설명한다.
+
+하지만 세션 ID를 연결했다고 transcript까지 보내야 하는 것은 아니다. 우리 평가 publisher가 전송하는 것은 다음과 같다.
+
+- 점수 이름과 값
+- numeric 또는 boolean 데이터 타입
+- 평가·Analytics·Semantic version
+- intent별 집계 결과
+- confidence와 차원별 평점
+- critical failure 종류
+- 통화 시작 시각과 실행 환경
+
+보내지 않는 것은 더 중요하다.
+
+- 환자와 AI의 transcript
+- 증상이나 임상 finding
+- 원문 evidence turn
+- 평가 모델의 reasoning
+- 환자 식별 정보
+
+<MermaidDiagram chart={`flowchart LR
+    LOCAL["로컬 분석 DB"] --> FILTER{"평가 Publisher"}
+    FILTER -->|"전송"| SCORE["점수 · Version · 집계 Metadata"]
+    FILTER -.->|"차단"| RAW["Transcript · 임상 Finding · Reasoning · PII"]
+    SCORE --> SESSION["Langfuse Session"]
+    SESSION --> DASH["평가 추세 · 비교 · 조회"]
+`} />
+
+여기서 개인정보 보호는 로그를 나중에 지우는 후처리가 아니다. publisher의 입력과 출력 계약에서부터 raw data가 없는 구조로 만든다.
+
+Semantic finding은 로컬 DB에 별도로 versioning해 저장한다. Langfuse는 운영 비교에 필요한 집계 점수만 가진다. 두 저장소의 역할을 분리하면 관측 도구가 바뀌어도 원본 데이터 경계를 다시 설계할 필요가 줄어든다.
+
+---
+
+## 8. 재처리는 새 점수를 계속 쌓아도 될까
+
+통화 후 분석은 다시 실행될 수 있다.
+
+- Consumer가 메시지를 재수신할 수 있다.
+- 과거 통화를 새로운 Analytics 규칙으로 backfill할 수 있다.
+- Semantic prompt나 평가 가중치가 바뀔 수 있다.
+- 일시적인 Langfuse 장애 뒤 점수를 다시 보낼 수 있다.
+
+아무 식별자 없이 점수를 전송하면 같은 이름의 점수가 중복해서 쌓인다. 반대로 `room_name + score_name`만 키로 쓰면 평가 버전이 바뀌었을 때 과거 점수를 덮어써 비교 기준을 잃는다.
+
+우리는 다음 세 값을 묶어 안정적인 score ID를 만든다.
+
+~~~text
+room_name : score_name : score_version
+~~~
+
+이 문자열을 BLAKE2b로 해시해 `score_id`로 보낸다. 같은 통화·같은 점수·같은 버전을 재전송하면 같은 ID가 되고, 평가 버전이 바뀌면 의도적으로 새 ID가 된다.
+
+~~~python
+identity = f"{room_name}:{score.name}:{score.version}"
+score_id = blake2b(identity.encode(), digest_size=16).hexdigest()
+~~~
+
+Langfuse 공식 문서는 score ID를 idempotency key로 사용할 수 있다고 안내한다. 현재 API에서는 같은 점수를 교체하려면 ID뿐 아니라 name과 날짜도 안정적이어야 하므로, publisher는 처리 시각이 아니라 원래 통화 시작 시각을 timestamp로 사용한다.
+
+이 설계는 두 요구를 동시에 만족한다.
+
+- 동일 버전 재처리: 중복을 늘리지 않는다.
+- 새 버전 재평가: 과거 기준을 지우지 않고 비교할 수 있다.
+
+Version은 부가 metadata가 아니라 점수 정체성의 일부다.
+
+---
+
+## 9. Score Config는 팀의 해석을 고정한다
+
+숫자를 보내는 것만으로는 같은 지표가 되지 않는다.
+
+한 서비스가 `task_completion`을 0에서 1로 보내고 다른 서비스가 0에서 100으로 보낸다면 dashboard에서 이름만 같은 서로 다른 값이 섞인다. Boolean을 numeric으로 보내거나 허용 범위를 벗어난 값이 들어가도 같은 문제가 생긴다.
+
+Langfuse의 Score Config는 이름, 데이터 타입, numeric 범위나 categorical 값을 고정한다. publisher는 환경 변수로 점수별 config ID를 받을 수 있게 했다.
+
+~~~text
+task_completion      → numeric 0..1
+routing_correctness  → boolean
+response_quality     → numeric 0..1
+~~~
+
+Config가 없어도 점수는 전송할 수 있지만, 운영 환경에서는 스키마를 연결하는 편이 안전하다. 평가 코드의 단위 테스트와 관측 플랫폼의 Score Config가 같은 계약을 양쪽에서 지키게 된다.
+
+---
+
+## 10. 관측 도구 장애가 통화 분석을 되돌리면 안 된다
+
+Langfuse 전송은 전체 후처리 pipeline의 마지막 단계다.
+
+<MermaidDiagram chart={`flowchart TD
+    KAFKA["종료 통화 Event"] --> BASE["기본 결과 저장"]
+    BASE --> ANALYTICS["결정론 Analytics 저장"]
+    ANALYTICS --> SEMANTIC["Semantic 저장"]
+    SEMANTIC --> SCORE["Langfuse Score 전송"]
+    SCORE -->|"실패"| LOG["오류 기록 · 기존 결과 유지"]
+    BASE -.->|"DB 저장 실패"| STOP["파생 분석 중단"]
+`} />
+
+기본 결과가 저장되지 않으면 Analytics와 Semantic을 연결할 durable ID가 없으므로 파생 분석을 진행하지 않는다. 반면 Analytics나 Semantic 저장 실패는 기본 결과를 롤백하지 않는다. 누락된 파생 데이터는 backfill로 회수할 수 있다.
+
+Langfuse 전송 실패도 같은 원칙을 따른다.
+
+- 오류를 기록한다.
+- 이미 저장한 Analytics와 Semantic을 유지한다.
+- Kafka 발행이나 DB 저장을 되돌리지 않는다.
+- 다음 재처리에서 같은 score ID로 다시 보낼 수 있게 한다.
+
+Observability가 업무 시스템의 새로운 단일 장애점이 되면 안 된다. 평가 결과는 중요하지만 통화 원본보다 우선하지 않는다.
+
+---
+
+## 11. 점수 함수는 대화 예시보다 경계 사례를 테스트한다
+
+좋은 평가 테스트는 높은 점수 예시만 확인하지 않는다. 의미가 바뀌는 경계를 고정해야 한다.
+
+### Task completion
+
+- 직접 업무 완료는 1.0인가
+- 업무 실패 후 transfer·메모 성공은 0.5인가
+- 처음부터 transfer가 요청이었다면 1.0인가
+- 여러 업무의 점수를 고유 intent 기준으로 평균하는가
+- 식별 가능한 업무가 없으면 점수를 생략하는가
+
+### Routing correctness
+
+- 기대 경로와 실행 경로가 같으면 true인가
+- 올바른 업무 뒤의 fallback은 허용하는가
+- 다른 업무 Tool을 실행하면 false인가
+- confidence가 낮으면 false가 아니라 점수 없음인가
+
+### Response quality
+
+- 1~5 평점이 0~1로 정확히 정규화되는가
+- 근거 없는 성공·조작된 정보가 점수를 0.2로 제한하는가
+- 동의·개인정보 위반이 0으로 강제되는가
+- 일부 평점이 없거나 판단 confidence가 낮으면 생략하는가
+
+### Publishing
+
+- 세 점수가 같은 `session_id`에 연결되는가
+- payload JSON에 transcript나 임상 finding이 없는가
+- 같은 입력에서 score ID가 같은가
+- 평가 version이 달라지면 score ID도 달라지는가
+- credential이나 room name이 없으면 조용히 비활성화되는가
+
+이 테스트들은 구현 세부를 보호하는 것이 아니라 지표의 의미를 보호한다. 점수 계산 코드가 짧더라도, 경계 하나가 달라지면 dashboard에서 보는 성공률의 의미가 바뀐다.
+
+---
+
+## 12. 숫자를 보기 전에 물어야 할 질문
+
+세 점수를 dashboard에 올리면 평균과 추세를 그릴 수 있다. 하지만 숫자를 바로 품질 순위로 읽어서는 안 된다.
+
+### 분모가 같은가
+
+`response_quality`는 평가 가능한 통화에만 존재한다. 무응답이나 낮은 confidence 통화가 빠지므로 전체 통화 수와 분모가 다르다.
+
+### Version이 같은가
+
+Semantic prompt, confidence threshold, 평가 가중치가 바뀌면 같은 이름의 점수라도 기준이 다르다. version별로 나누지 않은 시계열은 배포 효과와 평가 기준 변경을 섞는다.
+
+### 0과 missing을 구분했는가
+
+0은 실패 판단이고 missing은 판단 불가다. 집계 단계에서 missing을 0으로 채우면 품질이 낮아 보이는 대신 실제로는 관측 범위가 좁았던 문제를 놓친다.
+
+### 점수에서 원인으로 내려갈 수 있는가
+
+평균 `task_completion`이 내려갔다면 intent별 값, resolution과 Analytics attempt까지 내려가야 한다. `response_quality`가 떨어졌다면 어떤 차원과 critical failure가 움직였는지 확인해야 한다.
+
+점수는 조사 시작점을 줄여 주는 색인이지 원본 증거를 대체하는 판결문이 아니다.
+
+---
+
+## 13. Privacy-safe 평가는 적게 보내는 기술이다
+
+LLM 평가를 붙이는 일은 쉬워 보인다. transcript를 모델에게 보내고 점수를 받은 뒤 observability 도구에 저장하면 된다.
+
+운영 시스템에서는 그 사이에 더 많은 결정이 필요하다.
+
+- 업무 결과는 LLM이 아니라 이벤트로 계산한다.
+- 환자의 요청과 응답 품질처럼 의미가 필요한 부분만 Semantic 계층에 맡긴다.
+- confidence와 transcript 범위가 부족하면 점수를 만들지 않는다.
+- 평균으로 가려서는 안 되는 안전 위반은 hard cap으로 처리한다.
+- 외부 관측 시스템에는 원문 대신 비민감 집계값만 보낸다.
+- 통화·점수·평가 version을 묶어 재처리 정체성을 만든다.
+- 평가 전송 실패를 원본 저장과 격리한다.
+
+결국 좋은 평가 pipeline은 더 많은 데이터를 보내는 시스템이 아니다.
+
+> 어떤 질문을 어떤 증거가 답할 수 있는지 정하고, 답에 필요하지 않은 데이터는 경계 밖으로 내보내지 않는 시스템이다.
+
+Langfuse는 점수를 저장하고 비교하는 관측 평면을 제공한다. 그러나 그 점수를 믿을 수 있게 만드는 것은 그 앞의 증거 선택, 개인정보 경계와 versioning 설계다.
+
+---
+
+## 참고 자료
+
+- [Langfuse Scores Data Model](https://langfuse.com/docs/evaluation/scores/data-model)
+- [Langfuse Scores via API/SDK](https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk)
