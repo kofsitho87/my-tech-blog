@@ -1,14 +1,19 @@
 // @ts-check
 
 import mdx from '@astrojs/mdx';
+import { unified } from '@astrojs/markdown-remark';
 import sitemap from '@astrojs/sitemap';
 import { defineConfig, fontProviders } from 'astro/config';
+import rehypeWrapTables from './src/plugins/rehype-wrap-tables.mjs';
 
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://kofsitho87.github.io',
 	base: '/my-tech-blog',
 	integrations: [mdx(), sitemap()],
+	markdown: {
+		processor: unified({ rehypePlugins: [rehypeWrapTables] }),
+	},
 	fonts: [
 		{
 			provider: fontProviders.local(),
